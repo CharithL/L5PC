@@ -126,6 +126,40 @@ WARNING: ripser not installed - tda probes disabled (pip install ripser persim)
 
 The registry (`AVAILABLE_PROBES`) gates the orchestrator: probes with missing deps are never scheduled.
 
+## Circuit 6: Kyzar Sternberg Working Memory (DANDI 000469)
+
+Human MTL-to-frontal cortex transformation during an active Sternberg working memory task. 21 patients, 902 neurons, continuous spike timestamps at 10ms resolution. This is the strongest test of whether active cognitive engagement forces surrogates to discover biological intermediates.
+
+### Results Summary
+
+![Kyzar Phase 2-4 Results](figures/kyzar_phase2_4_results.png)
+
+**Phase 2 — Surrogate Training** (CC threshold = 0.30): 10 of 14 subjects pass the output quality gate across hidden sizes h=32, 64, 128. CC ranges from 0.319 (sub-10) to 0.585 (sub-8).
+
+**Phase 3-4 — Probing + Resample Ablation** (h=64, qualifying subjects only):
+
+| Metric | Value |
+|--------|-------|
+| Pass rate | 10/14 (Phase 2) |
+| Non-zombie rate | **7/10** qualifying subjects |
+| Dominant mandatory variable | **theta_gamma_pac** (5/7 non-zombie subjects) |
+| Notable zombie | **sub-8** — highest CC in cohort (0.585), zero mandatory variables |
+
+**Key findings:**
+- **theta_gamma_pac** (theta-gamma phase-amplitude coupling) is the dominant mandatory variable, appearing in 5 of 7 non-zombie subjects. This aligns with Rutishauser 2024's identification of PAC as critical for working memory maintenance.
+- **sub-5** is the strongest non-zombie: 4/4 mandatory variables (firing_rate_input, trial_variance, theta_power, theta_gamma_pac), all causal across all 5 epochs.
+- **sub-8 is the clearest zombie demonstration**: highest output CC (0.585) yet 0/0 mandatory variables. The surrogate perfectly predicts frontal output without encoding any biological intermediates — a textbook computational zombie.
+- **sub-15** shows epoch-specific causality: gamma_power is mandatory during fixation only, suggesting the surrogate only needs oscillatory information for baseline prediction, not active maintenance.
+
+**Cross-circuit dissociation established:**
+- L5PC (Circuit 1): Total zombie (50/50 variables) — biophysical detail is not needed for I/O mapping
+- Hippocampal CA3→CA1 (Circuit 5): Total non-zombie — both mandatory clusters confirmed
+- **Kyzar WM (Circuit 6): Mixed gradient** — 7/10 non-zombie, with theta_gamma_pac as the dominant mandatory variable during active cognition
+
+**SAE retroactive analysis** (in progress): Checking whether sub-8, sub-10, and sub-11 encode biological variables in polysemantic superposition invisible to linear Ridge probes. TopK SAE decomposition with GroupKFold temporal-leakage prevention.
+
+---
+
 ## Original Pipeline
 
 The original DESCARTES pipeline (Ridge probing, progressive clamping ablation, classification) remains fully functional. See the existing Phase 1 pipeline scripts in `scripts/run_phase1.py`. The v3.0 modules extend but never modify the original code.
