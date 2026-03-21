@@ -569,6 +569,7 @@ def _population_synchrony(X, win):
         if np.sum(active) < 2:
             continue
         C = np.corrcoef(chunk[:, active].T)
+        C = np.nan_to_num(C, nan=0.0)
         triu = np.triu_indices(C.shape[0], k=1)
         result[i] = float(np.mean(np.abs(C[triu])))
 
@@ -713,6 +714,9 @@ def extract_hidden_states(model, X_data, n_trials, device='cpu'):
 
 def ridge_delta_r2(H_trained, H_untrained, target, groups, alpha=1.0):
     gkf = GroupKFold(n_splits=5)
+    # Replace NaN/Inf with 0
+    if np.any(np.isnan(target)) or np.any(np.isinf(target)):
+        target = np.nan_to_num(target, nan=0.0, posinf=0.0, neginf=0.0)
     if np.std(target) < 1e-10:
         return {'r2_trained': 0.0, 'r2_untrained': 0.0, 'delta_r2': 0.0}
     r2_t = float(np.mean(cross_val_score(
@@ -886,7 +890,7 @@ def run_condition(condition_name, trials, original_trials, hidden_dim,
 
     H_t = np.concatenate(h_tr_all, axis=0).astype(np.float64)
     H_u = np.concatenate(h_un_all, axis=0).astype(np.float64)
-    bio_targets = np.concatenate(bio_all, axis=0).astype(np.float64)
+    bio_targets = np.nan_to_num(np.concatenate(bio_all, axis=0).astype(np.float64), nan=0.0)
     groups = np.array(trial_groups_all)
 
     log.info("  Samples: %d, Groups: %d unique trials", len(H_t), len(np.unique(groups)))
