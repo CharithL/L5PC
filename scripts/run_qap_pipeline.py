@@ -169,25 +169,23 @@ def run_phase0():
     log.info("PHASE 0: GOVERNANCE")
     log.info("=" * 60)
 
-    # Epistemic labels
+    # Epistemic labels (library module — no standalone runner, just import check)
     from descartes.council_controls.priority0_epistemic.epistemic_labels import (
-        generate_epistemic_labels)
-    generate_epistemic_labels()
+        label_result, EpistemicPhase, EpistemicStatus)
+    log.info("  Epistemic labeling module loaded OK")
 
     # Consent audit
-    from descartes.council_controls.priority0b_governance.consent_audit import (
-        run_consent_audit)
-    run_consent_audit()
+    from descartes.council_controls.priority0b_governance.consent_audit import run_audit
+    run_audit()
 
     # DURA matrix
-    from descartes.council_controls.priority0b_governance.dura_matrix import (
-        generate_dura_matrix)
-    generate_dura_matrix()
+    from descartes.council_controls.priority0b_governance.dura_matrix import generate_dura
+    generate_dura()
 
-    # Governance checklist
+    # Governance checklist (library module — no standalone runner)
     from descartes.council_controls.priority0b_governance.governance_checklist import (
-        generate_governance_checklist)
-    generate_governance_checklist()
+        check_governance)
+    log.info("  Governance checklist module loaded OK")
 
     log.info("Phase 0 complete. Review results/governance/ before proceeding.")
 
@@ -228,36 +226,20 @@ def run_phase3(args):
     log.info("=" * 60)
 
     from descartes.council_controls.priority3_baseline_variance.run_50_seeds import (
-        run_50_seeds)
+        run_seed_sweep)
     from descartes.council_controls.priority3_baseline_variance.baseline_distribution import (
-        compute_baseline_distribution)
+        analyze_distributions)
     from descartes.council_controls.priority3_baseline_variance.retrofit_all_circuits import (
-        retrofit_all_circuits)
-
-    circuit_data, targets, lstm_h_tr, _, _, _ = (
-        load_circuit_data(args.processed_dir, args.subject, args.model_dir, args.device))
-
-    cname = list(circuit_data.keys())[0]
-    X = circuit_data[cname]['X']
-    hidden_dim = 64
+        run_retrofit)
 
     log.info("Running 50 untrained seeds...")
-    run_50_seeds(
-        X=X, targets=targets, hidden_dim=hidden_dim,
-        n_seeds=50, results_dir='results/council_controls/phase3_baseline_variance',
-    )
+    run_seed_sweep()
 
     log.info("Computing baseline distribution...")
-    compute_baseline_distribution(
-        results_dir='results/council_controls/phase3_baseline_variance')
+    analyze_distributions()
 
-    if lstm_h_tr is not None:
-        log.info("Retrofitting trained results against baseline...")
-        retrofit_all_circuits(
-            trained_hidden=lstm_h_tr, targets=targets,
-            baseline_dir='results/council_controls/phase3_baseline_variance',
-            results_dir='results/council_controls/phase3_baseline_variance',
-        )
+    log.info("Retrofitting trained results against baseline...")
+    run_retrofit()
 
 
 def run_phase5(args):
@@ -267,11 +249,9 @@ def run_phase5(args):
     log.info("=" * 60)
 
     from descartes.council_controls.priority5_twostage_ablation.correlation_structure import (
-        compute_correlation_structure)
-    from descartes.council_controls.priority5_twostage_ablation.conditional_ablation import (
-        conditional_ablation)
+        analyze_correlation_structure)
     from descartes.council_controls.priority5_twostage_ablation.twostage_classify import (
-        twostage_classify)
+        run_twostage_classification)
 
     _, targets, lstm_h_tr, _, _, _ = (
         load_circuit_data(args.processed_dir, args.subject, args.model_dir, args.device))
@@ -283,15 +263,20 @@ def run_phase5(args):
     results_dir = 'results/council_controls/phase5_twostage'
 
     log.info("Computing correlation structure...")
-    compute_correlation_structure(
-        hidden_states=lstm_h_tr, results_dir=results_dir)
+    analyze_correlation_structure(
+        hidden_states=lstm_h_tr, output_dir=results_dir)
 
-    log.info("Running conditional ablation...")
-    conditional_ablation(
-        hidden_states=lstm_h_tr, targets=targets, results_dir=results_dir)
+    # Two-stage classification needs a probe target — use first bio target
+    first_target_name = list(targets.keys())[0]
+    first_target = targets[first_target_name]
+    n = min(len(first_target), lstm_h_tr.shape[0])
 
-    log.info("Classifying variables...")
-    twostage_classify(results_dir=results_dir)
+    log.info("Running two-stage classification on %s...", first_target_name)
+    run_twostage_classification(
+        hidden_states=lstm_h_tr[:n],
+        probe_target=first_target[:n],
+        output_dir=results_dir,
+    )
 
 
 def main():
