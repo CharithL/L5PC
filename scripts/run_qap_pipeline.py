@@ -190,6 +190,49 @@ def run_phase0():
     log.info("Phase 0 complete. Review results/governance/ before proceeding.")
 
 
+def validate_lstm_baseline(lstm_h_tr, lstm_h_un, targets, groups, subject_id):
+    """Bug 1 fix: Validate that LSTM baseline reproduces original C6 probing.
+
+    If theta_gamma_pac is not found as significant for a known non-zombie subject,
+    the probing code has diverged and all Phase 1 results are invalid.
+    """
+    from descartes.council_controls.priority1_architecture.run_p1_control import (
+        ridge_delta_r2_groupkfold)
+
+    log.info("=== LSTM BASELINE VALIDATION (sub-%s) ===", subject_id)
+    log.info("  H_trained: %s range=[%.4f, %.4f]",
+             lstm_h_tr.shape, lstm_h_tr.min(), lstm_h_tr.max())
+    log.info("  H_untrained: %s range=[%.4f, %.4f]",
+             lstm_h_un.shape, lstm_h_un.min(), lstm_h_un.max())
+    log.info("  NaN: trained=%s untrained=%s",
+             np.isnan(lstm_h_tr).any(), np.isnan(lstm_h_un).any())
+    log.info("  Zero-var cols: trained=%d untrained=%d",
+             int((lstm_h_tr.std(axis=0) < 1e-10).sum()),
+             int((lstm_h_un.std(axis=0) < 1e-10).sum()))
+
+    for vname, target in targets.items():
+        n = min(len(target), lstm_h_tr.shape[0], lstm_h_un.shape[0], len(groups))
+        result = ridge_delta_r2_groupkfold(
+            lstm_h_tr[:n], lstm_h_un[:n], target[:n], groups[:n])
+        log.info("  %s: dR2=%.4f (trained=%.4f, untrained=%.4f)",
+                 vname, result['delta_R2'], result['R2_trained'], result['R2_untrained'])
+
+    # Check theta_gamma_pac specifically
+    if 'theta_gamma_pac' in targets:
+        n = min(len(targets['theta_gamma_pac']), lstm_h_tr.shape[0], len(groups))
+        pac_result = ridge_delta_r2_groupkfold(
+            lstm_h_tr[:n], lstm_h_un[:n], targets['theta_gamma_pac'][:n], groups[:n])
+        if pac_result['delta_R2'] <= 0:
+            log.warning("  WARNING: theta_gamma_pac dR2=%.4f <= 0", pac_result['delta_R2'])
+            log.warning("  LSTM baseline may not reproduce original C6 finding.")
+            log.warning("  Proceeding with caution — check hidden state extraction path.")
+        else:
+            log.info("  theta_gamma_pac dR2=%.4f > 0 — baseline looks reasonable",
+                     pac_result['delta_R2'])
+
+    log.info("=== LSTM BASELINE VALIDATION COMPLETE ===")
+
+
 def run_phase1(args):
     """Phase 1: Architecture control (GPU)."""
     log.info("=" * 60)
@@ -201,6 +244,15 @@ def run_phase1(args):
 
     circuit_data, targets, lstm_h_tr, lstm_h_un, lstm_pred, lstm_r2 = (
         load_circuit_data(args.processed_dir, args.subject, args.model_dir, args.device))
+
+    # Bug 1: Validate LSTM baseline before running architecture comparison
+    if lstm_h_tr is not None and lstm_h_un is not None:
+        cname = list(circuit_data.keys())[0]
+        T = circuit_data[cname]['X'].shape[0]
+        trial_size = circuit_data[cname].get('trial_size', 2000)
+        n_trials = max(1, T // trial_size)
+        groups = np.repeat(np.arange(n_trials), trial_size)[:T]
+        validate_lstm_baseline(lstm_h_tr, lstm_h_un, targets, groups, args.subject)
 
     result = run_p1_control(
         circuit_data=circuit_data,

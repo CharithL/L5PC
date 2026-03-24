@@ -439,6 +439,17 @@ def run_single_architecture(
     logger.info("=== Architecture: %s (output R2=%.3f) ===", arch_name,
                 output_r2)
 
+    # Diagnostic prints (Bug 1 requirement)
+    logger.info("  H_trained: %s range=[%.4f, %.4f]",
+                H_trained.shape, H_trained.min(), H_trained.max())
+    logger.info("  H_untrained: %s range=[%.4f, %.4f]",
+                H_untrained.shape, H_untrained.min(), H_untrained.max())
+    logger.info("  NaN: trained=%s untrained=%s",
+                np.isnan(H_trained).any(), np.isnan(H_untrained).any())
+    logger.info("  Zero-var cols: trained=%d untrained=%d",
+                int((H_trained.std(axis=0) < 1e-10).sum()),
+                int((H_untrained.std(axis=0) < 1e-10).sum()))
+
     n_samples = H_trained.shape[0]
     var_results = {}
 
@@ -516,10 +527,12 @@ def _train_mlp_architecture(
     window_ms: int,
     dt_ms: float = 0.5,
     device: str = 'cpu',
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, int]:
     """Train MLP with specified window and extract hidden states.
 
-    Returns (H_trained, H_untrained, output_pred, test_r2).
+    Returns (H_trained, H_untrained, output_pred, test_r2, window_bins).
+    The window_bins offset is returned so the caller can align targets:
+    targets must be sliced as target[window_bins-1:] to match hidden states.
     """
     import torch
     from descartes.council_controls.priority1_architecture.mlp_timelag import (
@@ -548,11 +561,12 @@ def _train_mlp_architecture(
         model_trained, X_w, Y_a, train_mask, test_mask, device=device,
     )
 
-    # Extract trained hidden states
+    # Extract trained hidden states — shape (T - window_bins + 1, hidden_dim)
+    # Hidden state[i] corresponds to input timestep (i + window_bins - 1)
     model_trained.train(False)
     H_trained = model_trained.extract_hidden_states(X_sequence)
 
-    # Untrained model (random init)
+    # Untrained model (random init) — SAME window, random weights
     model_untrained = MLPTimeLag(n_input, n_output, window_bins)
     model_untrained.train(False)
     H_untrained = model_untrained.extract_hidden_states(X_sequence)
@@ -573,8 +587,11 @@ def _train_mlp_architecture(
 
     # Align sizes
     n_aligned = min(H_trained.shape[0], H_untrained.shape[0], n_samples)
+    logger.info("  MLP-%dms: window_bins=%d, H shape=(%d, %d), offset=%d timesteps",
+                window_ms, window_bins, n_aligned, H_trained.shape[1], window_bins - 1)
+
     return (H_trained[:n_aligned], H_untrained[:n_aligned],
-            output_pred[:n_aligned], float(test_r2))
+            output_pred[:n_aligned], float(test_r2), window_bins)
 
 
 def _train_pysr_architecture(
@@ -772,28 +789,47 @@ def run_p1_control(
             arch_name = f"MLP_{window_ms}ms"
             logger.info("Training %s...", arch_name)
             try:
-                H_tr, H_un, out_pred, test_r2 = _train_mlp_architecture(
+                H_tr, H_un, out_pred, test_r2, w_bins = _train_mlp_architecture(
                     X_seq, Y_seq, window_ms, dt_ms, device,
                 )
-                # Align groups
-                n = min(H_tr.shape[0], len(groups))
-                g = groups[:n]
+                n = min(H_tr.shape[0], H_un.shape[0])
 
-                # Align targets
+                # CRITICAL FIX (Bug 2): MLP hidden states start at timestep
+                # (window_bins - 1), so targets and groups must be sliced to match.
+                # Hidden state[i] corresponds to input timestep (i + w_bins - 1).
+                offset = w_bins - 1
+                g = groups[offset:offset + n]
+
                 aligned_targets = {}
                 for vn, vy in targets.items():
-                    if len(vy) >= n:
-                        aligned_targets[vn] = vy[:n]
+                    if len(vy) >= offset + n:
+                        aligned_targets[vn] = vy[offset:offset + n]
+                    elif len(vy) > offset:
+                        usable = len(vy) - offset
+                        aligned_targets[vn] = vy[offset:offset + usable]
+
+                # Ensure consistent length
+                if aligned_targets:
+                    min_len = min(n, len(g), min(len(v) for v in aligned_targets.values()))
+                else:
+                    min_len = min(n, len(g))
+
+                logger.info("  %s alignment: offset=%d, n_samples=%d",
+                            arch_name, offset, min_len)
 
                 result = run_single_architecture(
-                    arch_name, H_tr[:n], H_un[:n], out_pred[:n],
-                    aligned_targets, g, test_r2,
+                    arch_name, H_tr[:min_len], H_un[:min_len], out_pred[:min_len],
+                    {k: v[:min_len] for k, v in aligned_targets.items()},
+                    g[:min_len], test_r2,
                 )
                 result['circuit'] = circuit_name
+                result['window_offset'] = offset
                 all_arch_results.append(result)
 
             except Exception as e:
                 logger.error("  %s failed: %s", arch_name, e)
+                import traceback
+                traceback.print_exc()
                 continue
 
         # --- PySR architecture ---
