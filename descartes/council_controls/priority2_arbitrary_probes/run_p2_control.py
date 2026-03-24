@@ -124,11 +124,13 @@ def probe_single_target(
     gkf = GroupKFold(n_splits=actual_splits)
 
     def _cv_r2(H, y):
+        _eps = 1e-8
         fold_r2s = []
         for train_idx, test_idx in gkf.split(H, y, groups):
-            scaler = StandardScaler()
-            X_train = scaler.fit_transform(H[train_idx])
-            X_test = scaler.transform(H[test_idx])
+            mean_h = H[train_idx].mean(axis=0)
+            std_h = H[train_idx].std(axis=0) + _eps
+            X_train = (H[train_idx] - mean_h) / std_h
+            X_test = (H[test_idx] - mean_h) / std_h
             y_train, y_test = y[train_idx], y[test_idx]
             y_std = y_train.std()
             if y_std < 1e-10:

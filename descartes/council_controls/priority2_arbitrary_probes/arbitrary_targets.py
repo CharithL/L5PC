@@ -112,8 +112,8 @@ def generate_pca_input_targets(
     -------
     targets : dict mapping target_name -> ndarray (n_samples,)
     """
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_input)
+    _eps = 1e-8
+    X_scaled = (X_input - X_input.mean(axis=0)) / (X_input.std(axis=0) + _eps)
 
     n_comp = min(n_components, X_scaled.shape[0], X_scaled.shape[1])
     pca = PCA(n_components=n_comp, random_state=random_state)

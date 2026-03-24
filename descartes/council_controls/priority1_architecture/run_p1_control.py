@@ -31,7 +31,8 @@ import numpy as np
 from scipy import stats
 from sklearn.linear_model import RidgeCV
 from sklearn.model_selection import GroupKFold
-from sklearn.preprocessing import StandardScaler
+# StandardScaler removed — zero-variance features in untrained MLPs produce NaN.
+# Use epsilon-safe manual scaling instead.
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,25 @@ ABLATION_K_FRACTIONS = [0.05, 0.10, 0.20, 0.40, 0.60, 0.80]
 ABLATION_N_RANDOM = 10
 IAAFT_N_SURROGATES = 200
 IAAFT_ITERATIONS = 20
+
+
+# ---------------------------------------------------------------------------
+# Epsilon-safe scaling (replaces StandardScaler to handle zero-variance dims)
+# ---------------------------------------------------------------------------
+
+_EPS = 1e-8
+
+
+def _safe_scale_fit(X_train):
+    """Compute mean/std from training data with epsilon floor."""
+    mean = X_train.mean(axis=0)
+    std = X_train.std(axis=0) + _EPS
+    return mean, std
+
+
+def _safe_scale_transform(X, mean, std):
+    """Apply epsilon-safe scaling."""
+    return (X - mean) / std
 
 
 # ---------------------------------------------------------------------------
@@ -99,10 +119,10 @@ def ridge_delta_r2_groupkfold(
     r2_untrained_folds = []
 
     for train_idx, test_idx in gkf.split(H_trained, target, groups):
-        # Trained hidden states
-        scaler_tr = StandardScaler()
-        X_tr_train = scaler_tr.fit_transform(H_trained[train_idx])
-        X_tr_test = scaler_tr.transform(H_trained[test_idx])
+        # Trained hidden states (epsilon-safe scaling)
+        mean_tr, std_tr = _safe_scale_fit(H_trained[train_idx])
+        X_tr_train = _safe_scale_transform(H_trained[train_idx], mean_tr, std_tr)
+        X_tr_test = _safe_scale_transform(H_trained[test_idx], mean_tr, std_tr)
 
         y_train = target[train_idx]
         y_test = target[test_idx]
@@ -121,10 +141,10 @@ def ridge_delta_r2_groupkfold(
         ridge_tr.fit(X_tr_train, y_train_s)
         r2_trained_folds.append(float(ridge_tr.score(X_tr_test, y_test_s)))
 
-        # Untrained hidden states
-        scaler_un = StandardScaler()
-        X_un_train = scaler_un.fit_transform(H_untrained[train_idx])
-        X_un_test = scaler_un.transform(H_untrained[test_idx])
+        # Untrained hidden states (epsilon-safe scaling)
+        mean_un, std_un = _safe_scale_fit(H_untrained[train_idx])
+        X_un_train = _safe_scale_transform(H_untrained[train_idx], mean_un, std_un)
+        X_un_test = _safe_scale_transform(H_untrained[test_idx], mean_un, std_un)
 
         ridge_un = RidgeCV(alphas=alphas)
         ridge_un.fit(X_un_train, y_train_s)
@@ -230,9 +250,9 @@ def iaaft_null_distribution(
     def _compute_r2(y):
         fold_r2s = []
         for train_idx, test_idx in gkf.split(H, y, groups):
-            scaler = StandardScaler()
-            X_train = scaler.fit_transform(H[train_idx])
-            X_test = scaler.transform(H[test_idx])
+            mean_h, std_h = _safe_scale_fit(H[train_idx])
+            X_train = _safe_scale_transform(H[train_idx], mean_h, std_h)
+            X_test = _safe_scale_transform(H[test_idx], mean_h, std_h)
             y_train, y_test = y[train_idx], y[test_idx]
             y_std = y_train.std()
             if y_std < 1e-10:
@@ -319,8 +339,8 @@ def resample_ablation_generic(
     sorted_dims = np.argsort(dim_corrs)[::-1]
 
     # Baseline: probe R2 from intact H -> output
-    scaler = StandardScaler()
-    H_scaled = scaler.fit_transform(H)
+    mean_h, std_h = _safe_scale_fit(H)
+    H_scaled = _safe_scale_transform(H, mean_h, std_h)
     ridge = RidgeCV(alphas=RIDGE_ALPHAS)
     ridge.fit(H_scaled, output_target)
     baseline_r2 = float(ridge.score(H_scaled, output_target))

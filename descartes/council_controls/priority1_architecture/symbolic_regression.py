@@ -423,12 +423,15 @@ def fit_symbolic_surrogate(
     backend : str
         Which backend was used: 'pysr', 'gplearn', or 'minimal_gp'.
     """
-    # Standardize inputs for numerical stability
-    scaler_x = StandardScaler()
-    X_scaled = scaler_x.fit_transform(X_lagged)
+    # Epsilon-safe standardization (avoids NaN from zero-variance features)
+    _eps = 1e-8
+    x_mean = X_lagged.mean(axis=0)
+    x_std = X_lagged.std(axis=0) + _eps
+    X_scaled = (X_lagged - x_mean) / x_std
 
-    scaler_y = StandardScaler()
-    y_scaled = scaler_y.fit_transform(y.reshape(-1, 1)).ravel()
+    y_mean = y.mean()
+    y_std = y.std() + _eps
+    y_scaled = (y - y_mean) / y_std
 
     # Attempt 1: PySR
     try:
