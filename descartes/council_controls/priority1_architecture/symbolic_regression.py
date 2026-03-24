@@ -32,7 +32,7 @@ import numpy as np
 from scipy import stats
 from sklearn.linear_model import RidgeCV
 from sklearn.model_selection import KFold
-from sklearn.preprocessing import StandardScaler
+# StandardScaler removed — epsilon-safe manual scaling used instead
 
 logger = logging.getLogger(__name__)
 
@@ -453,8 +453,10 @@ def fit_symbolic_surrogate(
             default_kwargs.update(pysr_kwargs)
         model = PySRRegressor(**default_kwargs)
         model.fit(X_scaled, y_scaled)
-        model._descartes_scaler_x = scaler_x
-        model._descartes_scaler_y = scaler_y
+        model._descartes_x_mean = x_mean
+        model._descartes_x_std = x_std
+        model._descartes_y_mean = y_mean
+        model._descartes_y_std = y_std
         return model, 'pysr'
     except ImportError:
         pass
@@ -477,8 +479,10 @@ def fit_symbolic_surrogate(
             verbose=0,
         )
         model.fit(X_scaled, y_scaled)
-        model._descartes_scaler_x = scaler_x
-        model._descartes_scaler_y = scaler_y
+        model._descartes_x_mean = x_mean
+        model._descartes_x_std = x_std
+        model._descartes_y_mean = y_mean
+        model._descartes_y_std = y_std
         return model, 'gplearn'
     except ImportError:
         pass
@@ -492,8 +496,10 @@ def fit_symbolic_surrogate(
         random_state=random_state,
     )
     model.fit(X_scaled, y_scaled)
-    model._descartes_scaler_x = scaler_x
-    model._descartes_scaler_y = scaler_y
+    model._descartes_x_mean = x_mean
+    model._descartes_x_std = x_std
+    model._descartes_y_mean = y_mean
+    model._descartes_y_std = y_std
     return model, 'minimal_gp'
 
 
@@ -523,9 +529,10 @@ def extract_symbolic_hidden_states(
     H : ndarray, shape (n_samples, n_sub_expressions)
         Sub-expression activations at each timestep.
     """
-    scaler_x = getattr(model, '_descartes_scaler_x', None)
-    if scaler_x is not None:
-        X_scaled = scaler_x.transform(X_lagged)
+    x_mean = getattr(model, '_descartes_x_mean', None)
+    x_std = getattr(model, '_descartes_x_std', None)
+    if x_mean is not None and x_std is not None:
+        X_scaled = (X_lagged - x_mean) / x_std
     else:
         X_scaled = X_lagged
 
@@ -740,19 +747,19 @@ def fit_and_extract(
         all_hidden_trained.append(H_trained)
 
         # Predictions on test set
-        scaler_x = getattr(model, '_descartes_scaler_x', None)
-        scaler_y = getattr(model, '_descartes_scaler_y', None)
-        X_test_s = scaler_x.transform(X_test) if scaler_x else X_test
+        x_mean = getattr(model, '_descartes_x_mean', None)
+        x_std = getattr(model, '_descartes_x_std', None)
+        y_mean = getattr(model, '_descartes_y_mean', 0.0)
+        y_std = getattr(model, '_descartes_y_std', 1.0)
+        X_test_s = (X_test - x_mean) / x_std if x_mean is not None else X_test
 
         if backend == 'minimal_gp':
             pred_scaled = model.predict(X_test_s)
         else:
             pred_scaled = model.predict(X_test_s)
 
-        if scaler_y is not None:
-            pred = scaler_y.inverse_transform(
-                pred_scaled.reshape(-1, 1)
-            ).ravel()
+        if y_std is not None and y_mean is not None:
+            pred = pred_scaled * y_std + y_mean
         else:
             pred = pred_scaled
 
