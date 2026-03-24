@@ -190,84 +190,168 @@ def run_phase0():
     log.info("Phase 0 complete. Review results/governance/ before proceeding.")
 
 
-def validate_lstm_baseline(lstm_h_tr, lstm_h_un, targets, groups, subject_id):
-    """Bug 1 fix: Validate that LSTM baseline reproduces original C6 probing.
+def validate_lstm_baseline_original(processed_dir, model_dir, subject_id, hidden_dim=64):
+    """Bug 1 fix: Run the EXACT original Phase 3-4 probing on this subject.
 
-    If theta_gamma_pac is not found as significant for a known non-zombie subject,
-    the probing code has diverged and all Phase 1 results are invalid.
+    Uses the same load_session, ridge_delta_r2, and resample_ablation functions
+    from run_kyzar_phase3_4.py — NOT a reimplementation.
+
+    Returns the original session_data dict and phase3 results for use in P1.
     """
-    from descartes.council_controls.priority1_architecture.run_p1_control import (
-        ridge_delta_r2_groupkfold)
+    # Import the EXACT functions from the original Phase 3-4 script
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "kyzar_phase3_4",
+        Path(__file__).parent / "run_kyzar_phase3_4.py")
+    phase34 = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(phase34)
 
     log.info("=== LSTM BASELINE VALIDATION (sub-%s) ===", subject_id)
-    log.info("  H_trained: %s range=[%.4f, %.4f]",
-             lstm_h_tr.shape, lstm_h_tr.min(), lstm_h_tr.max())
-    log.info("  H_untrained: %s range=[%.4f, %.4f]",
-             lstm_h_un.shape, lstm_h_un.min(), lstm_h_un.max())
-    log.info("  NaN: trained=%s untrained=%s",
-             np.isnan(lstm_h_tr).any(), np.isnan(lstm_h_un).any())
-    log.info("  Zero-var cols: trained=%d untrained=%d",
-             int((lstm_h_tr.std(axis=0) < 1e-10).sum()),
-             int((lstm_h_un.std(axis=0) < 1e-10).sum()))
+    log.info("  Using EXACT original Phase 3-4 code path")
 
-    for vname, target in targets.items():
-        n = min(len(target), lstm_h_tr.shape[0], lstm_h_un.shape[0], len(groups))
-        result = ridge_delta_r2_groupkfold(
-            lstm_h_tr[:n], lstm_h_un[:n], target[:n], groups[:n])
-        log.info("  %s: dR2=%.4f (trained=%.4f, untrained=%.4f)",
-                 vname, result['delta_R2'], result['R2_trained'], result['R2_untrained'])
+    # Load using original loader (gets pre-computed bio_targets.npz, proper trial groups)
+    session_data = phase34.load_session(processed_dir, model_dir, subject_id, hidden_dim)
+    if session_data is None:
+        log.error("  FAILED: Could not load session data for sub-%s", subject_id)
+        log.error("  Check: processed_dir=%s, model_dir=%s, h=%d",
+                  processed_dir, model_dir, hidden_dim)
+        return None, None
 
-    # Check theta_gamma_pac specifically
-    if 'theta_gamma_pac' in targets:
-        n = min(len(targets['theta_gamma_pac']), lstm_h_tr.shape[0], len(groups))
-        pac_result = ridge_delta_r2_groupkfold(
-            lstm_h_tr[:n], lstm_h_un[:n], targets['theta_gamma_pac'][:n], groups[:n])
-        if pac_result['delta_R2'] <= 0:
-            log.warning("  WARNING: theta_gamma_pac dR2=%.4f <= 0", pac_result['delta_R2'])
-            log.warning("  LSTM baseline may not reproduce original C6 finding.")
-            log.warning("  Proceeding with caution — check hidden state extraction path.")
-        else:
-            log.info("  theta_gamma_pac dR2=%.4f > 0 — baseline looks reasonable",
-                     pac_result['delta_R2'])
+    log.info("  H_trained: %s", session_data['H_trained'].shape)
+    log.info("  H_untrained: %s", session_data['H_untrained'].shape)
+    log.info("  Bio targets: %s (%d variables)",
+             session_data['bio_targets'].shape, len(session_data['bio_names']))
+    log.info("  Trial groups: %d unique", len(np.unique(session_data['trial_groups'])))
+    log.info("  CC: %.3f", session_data['model_info'].get('output_cc', 0))
+
+    # Run original Phase 3 probing
+    log.info("  Running original Phase 3 probing (all %d variables)...",
+             len(session_data['bio_names']))
+    phase3_results = phase34.run_phase3(session_data)
+
+    # Check theta_gamma_pac
+    pac_result = phase3_results.get('theta_gamma_pac', {})
+    pac_ridge = pac_result.get('ridge', {})
+    pac_dr2 = pac_ridge.get('delta_r2', 0)
+    log.info("  theta_gamma_pac: dR2=%.4f (trained=%.4f, untrained=%.4f)",
+             pac_dr2, pac_ridge.get('r2_trained', 0), pac_ridge.get('r2_untrained', 0))
+
+    # Run Phase 4 ablation on candidates
+    log.info("  Running original Phase 4 ablation...")
+    phase4_results = phase34.run_phase4(session_data, phase3_results)
+
+    # Check theta_gamma_pac ablation
+    pac_abl = phase4_results.get('theta_gamma_pac', {})
+    if pac_abl:
+        log.info("  theta_gamma_pac ablation: %s", pac_abl.get('overall_verdict', 'N/A'))
+        for k, v in pac_abl.get('per_k', {}).items():
+            log.info("    k=%s: z=%.2f %s", k, v.get('z_score', 0), v.get('verdict', ''))
+
+    # Summary of mandatory variables
+    mandatory = []
+    for vname, vresult in phase4_results.items():
+        if isinstance(vresult, dict) and vresult.get('overall_verdict') == 'MANDATORY':
+            mandatory.append(vname)
+    log.info("  MANDATORY variables: %s",
+             ', '.join(mandatory) if mandatory else 'NONE')
+
+    if not mandatory:
+        log.warning("  WARNING: No mandatory variables found by original pipeline.")
+        log.warning("  If this subject was previously non-zombie, something has changed.")
+    else:
+        log.info("  LSTM baseline VALIDATED — %d mandatory variables found", len(mandatory))
 
     log.info("=== LSTM BASELINE VALIDATION COMPLETE ===")
 
+    return session_data, phase3_results, phase4_results
+
 
 def run_phase1(args):
-    """Phase 1: Architecture control (GPU)."""
+    """Phase 1: Architecture control (GPU).
+
+    Step 1: Validate LSTM baseline using the EXACT original Phase 3-4 code.
+    Step 2: Run MLP/PySR architecture comparison using the original bio targets
+            and the original probing functions.
+    """
     log.info("=" * 60)
     log.info("PHASE 1: ARCHITECTURE CONTROL")
     log.info("=" * 60)
 
+    # Step 1: Run original Phase 3-4 on this subject as the LSTM baseline
+    validation = validate_lstm_baseline_original(
+        args.processed_dir, args.model_dir, args.subject)
+
+    if validation is None:
+        log.error("LSTM baseline validation failed — cannot proceed with P1")
+        return {'decision': 'ERROR', 'reasoning': 'LSTM baseline validation failed'}
+
+    session_data, phase3_results, phase4_results = validation
+
+    # Extract the original bio targets and probing data for MLP comparison
+    # The LSTM results are already computed by the original pipeline above.
+    # Now we need to run MLP architectures using the SAME targets and groups.
     from descartes.council_controls.priority1_architecture.run_p1_control import (
         run_p1_control)
 
-    circuit_data, targets, lstm_h_tr, lstm_h_un, lstm_pred, lstm_r2 = (
-        load_circuit_data(args.processed_dir, args.subject, args.model_dir, args.device))
+    # Build circuit_data from the original session
+    sess_name = 'session_sub{}_ses2'.format(args.subject)
+    data_dir = Path(args.processed_dir) / sess_name
+    X_data = dict(np.load(data_dir / 'X_trials.npz'))
+    Y_data = dict(np.load(data_dir / 'Y_trials.npz'))
 
-    # Bug 1: Validate LSTM baseline before running architecture comparison
-    if lstm_h_tr is not None and lstm_h_un is not None:
-        cname = list(circuit_data.keys())[0]
-        T = circuit_data[cname]['X'].shape[0]
-        trial_size = circuit_data[cname].get('trial_size', 2000)
-        n_trials = max(1, T // trial_size)
-        groups = np.repeat(np.arange(n_trials), trial_size)[:T]
-        validate_lstm_baseline(lstm_h_tr, lstm_h_un, targets, groups, args.subject)
+    # Concatenate all trials (same order as original)
+    meta = session_data['meta']
+    X_list, Y_list = [], []
+    for ti in range(meta['n_trials']):
+        key = 'trial_{}'.format(ti)
+        if key in X_data and key in Y_data:
+            X_list.append(X_data[key])
+            Y_list.append(Y_data[key])
 
+    X_seq = np.concatenate(X_list, axis=0).astype(np.float32)
+    Y_seq = np.concatenate(Y_list, axis=0).astype(np.float32)
+
+    # Use the ORIGINAL bio targets (from bio_targets.npz, not recomputed)
+    bio_names = session_data['bio_names']
+    bio_targets_mat = session_data['bio_targets']  # (T, 18)
+    original_targets = {}
+    for vi, vname in enumerate(bio_names):
+        original_targets[vname] = bio_targets_mat[:, vi]
+
+    circuit_data = {
+        'C6_sub{}'.format(args.subject): {
+            'X': X_seq, 'Y': Y_seq,
+            'trial_size': int(np.mean([x.shape[0] for x in X_list])),
+        }
+    }
+
+    # Step 2: Run P1 architecture comparison with ORIGINAL targets
+    # Include LSTM hidden states from original pipeline
     result = run_p1_control(
         circuit_data=circuit_data,
-        targets=targets,
+        targets=original_targets,
         results_dir='results/council_controls',
         dt_ms=10.0,
         device=args.device,
-        include_lstm=(lstm_h_tr is not None),
-        lstm_hidden_trained=lstm_h_tr,
-        lstm_hidden_untrained=lstm_h_un,
-        lstm_output_pred=lstm_pred,
-        lstm_output_r2=lstm_r2,
+        include_lstm=True,
+        lstm_hidden_trained=session_data['H_trained'],
+        lstm_hidden_untrained=session_data['H_untrained'],
+        lstm_output_pred=np.zeros((len(session_data['H_trained']), Y_seq.shape[1])),
+        lstm_output_r2=session_data['model_info'].get('output_cc', 0) ** 2,
     )
 
+    # Attach original Phase 3-4 results for comparison
+    result['original_phase3'] = {vname: {
+        'ridge_dr2': r.get('ridge', {}).get('delta_r2', 0),
+        'mlp_dr2': r.get('mlp', {}).get('delta_r2', 0),
+    } for vname, r in phase3_results.items()}
+    result['original_phase4_mandatory'] = [
+        vname for vname, r in phase4_results.items()
+        if isinstance(r, dict) and r.get('overall_verdict') == 'MANDATORY'
+    ]
+
     log.info("Phase 1 decision: %s", result.get('decision', 'UNKNOWN'))
+    log.info("Original Phase 3-4 mandatory: %s", result['original_phase4_mandatory'])
     return result
 
 
