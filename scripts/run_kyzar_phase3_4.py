@@ -139,9 +139,11 @@ def ridge_delta_r2(H_trained, H_untrained, target, groups, alpha=1.0):
         return {'r2_trained': 0.0, 'r2_untrained': 0.0, 'delta_r2': 0.0}
 
     r2_t = float(np.mean(cross_val_score(
-        Ridge(alpha), H_trained, target, cv=gkf, groups=groups, scoring='r2')))
+        Ridge(alpha), H_trained, target, cv=gkf, groups=groups, scoring='r2',
+        n_jobs=-1)))
     r2_u = float(np.mean(cross_val_score(
-        Ridge(alpha), H_untrained, target, cv=gkf, groups=groups, scoring='r2')))
+        Ridge(alpha), H_untrained, target, cv=gkf, groups=groups, scoring='r2',
+        n_jobs=-1)))
 
     return {'r2_trained': r2_t, 'r2_untrained': r2_u, 'delta_r2': r2_t - r2_u}
 
@@ -156,12 +158,12 @@ def mlp_delta_r2(H_trained, H_untrained, target, groups):
     mlp = MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=500,
                        early_stopping=True, random_state=42)
     r2_t = float(np.mean(cross_val_score(
-        mlp, H_trained, target, cv=gkf, groups=groups, scoring='r2')))
+        mlp, H_trained, target, cv=gkf, groups=groups, scoring='r2', n_jobs=-1)))
 
     mlp_u = MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=500,
                          early_stopping=True, random_state=42)
     r2_u = float(np.mean(cross_val_score(
-        mlp_u, H_untrained, target, cv=gkf, groups=groups, scoring='r2')))
+        mlp_u, H_untrained, target, cv=gkf, groups=groups, scoring='r2', n_jobs=-1)))
 
     return {'r2_trained': r2_t, 'r2_untrained': r2_u, 'delta_r2': r2_t - r2_u}
 
@@ -198,9 +200,9 @@ def epoch_specific_probe(H_trained, H_untrained, target, epoch_mask,
             continue
 
         r2_t = float(np.mean(cross_val_score(
-            Ridge(1.0), ht_ep, tgt_ep, cv=gkf, groups=grp_ep, scoring='r2')))
+            Ridge(1.0), ht_ep, tgt_ep, cv=gkf, groups=grp_ep, scoring='r2', n_jobs=-1)))
         r2_u = float(np.mean(cross_val_score(
-            Ridge(1.0), hu_ep, tgt_ep, cv=gkf, groups=grp_ep, scoring='r2')))
+            Ridge(1.0), hu_ep, tgt_ep, cv=gkf, groups=grp_ep, scoring='r2', n_jobs=-1)))
 
         epoch_results[epoch_name] = {
             'n_samples': int(n_samples),
@@ -287,7 +289,7 @@ def resample_ablation(H_trained, target, groups, k_values=None,
 
     # Baseline R2
     baseline_r2 = float(np.mean(cross_val_score(
-        Ridge(1.0), H_trained, target, cv=gkf, groups=groups, scoring='r2')))
+        Ridge(1.0), H_trained, target, cv=gkf, groups=groups, scoring='r2', n_jobs=-1)))
 
     # Per-dim correlation with target
     hdim = H_trained.shape[1]
@@ -302,7 +304,7 @@ def resample_ablation(H_trained, target, groups, k_values=None,
         H_ablated[:, top_k] = 0.0
 
         ablated_r2 = float(np.mean(cross_val_score(
-            Ridge(1.0), H_ablated, target, cv=gkf, groups=groups, scoring='r2')))
+            Ridge(1.0), H_ablated, target, cv=gkf, groups=groups, scoring='r2', n_jobs=-1)))
         degradation = baseline_r2 - ablated_r2
 
         # Random ablation control
@@ -312,7 +314,7 @@ def resample_ablation(H_trained, target, groups, k_values=None,
             H_rand = H_trained.copy()
             H_rand[:, rand_dims] = 0.0
             rr2 = float(np.mean(cross_val_score(
-                Ridge(1.0), H_rand, target, cv=gkf, groups=groups, scoring='r2')))
+                Ridge(1.0), H_rand, target, cv=gkf, groups=groups, scoring='r2', n_jobs=-1)))
             rand_r2s.append(rr2)
 
         rand_mean = float(np.mean(rand_r2s))
@@ -375,7 +377,7 @@ def epoch_specific_ablation(H_trained, target, epoch_mask, trial_groups,
 
         # Baseline
         base_r2 = float(np.mean(cross_val_score(
-            Ridge(1.0), ht_ep, tgt_ep, cv=gkf, groups=grp_ep, scoring='r2')))
+            Ridge(1.0), ht_ep, tgt_ep, cv=gkf, groups=grp_ep, scoring='r2', n_jobs=-1)))
 
         # Targeted ablation
         dim_corrs = np.array([abs(np.corrcoef(ht_ep[:, d], tgt_ep)[0, 1])
@@ -384,7 +386,7 @@ def epoch_specific_ablation(H_trained, target, epoch_mask, trial_groups,
         H_abl = ht_ep.copy()
         H_abl[:, top_k] = 0.0
         abl_r2 = float(np.mean(cross_val_score(
-            Ridge(1.0), H_abl, tgt_ep, cv=gkf, groups=grp_ep, scoring='r2')))
+            Ridge(1.0), H_abl, tgt_ep, cv=gkf, groups=grp_ep, scoring='r2', n_jobs=-1)))
 
         # Random control
         rand_r2s = []
@@ -393,7 +395,7 @@ def epoch_specific_ablation(H_trained, target, epoch_mask, trial_groups,
             H_r = ht_ep.copy()
             H_r[:, rd] = 0.0
             rr2 = float(np.mean(cross_val_score(
-                Ridge(1.0), H_r, tgt_ep, cv=gkf, groups=grp_ep, scoring='r2')))
+                Ridge(1.0), H_r, tgt_ep, cv=gkf, groups=grp_ep, scoring='r2', n_jobs=-1)))
             rand_r2s.append(rr2)
 
         rand_mean = float(np.mean(rand_r2s))
