@@ -190,116 +190,159 @@ def run_phase0():
     log.info("Phase 0 complete. Review results/governance/ before proceeding.")
 
 
-def validate_lstm_baseline_original(processed_dir, model_dir, subject_id, hidden_dim=64):
-    """Bug 1 fix: Run the EXACT original Phase 3-4 probing on this subject.
-
-    Uses the same load_session, ridge_delta_r2, and resample_ablation functions
-    from run_kyzar_phase3_4.py — NOT a reimplementation.
-
-    Returns the original session_data dict and phase3 results for use in P1.
-    """
-    # Import the EXACT functions from the original Phase 3-4 script
+def _import_phase34():
+    """Import the original Phase 3-4 module by file path."""
     import importlib.util
     spec = importlib.util.spec_from_file_location(
         "kyzar_phase3_4",
         Path(__file__).parent / "run_kyzar_phase3_4.py")
     phase34 = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(phase34)
+    return phase34
 
-    log.info("=== LSTM BASELINE VALIDATION (sub-%s) ===", subject_id)
-    log.info("  Using EXACT original Phase 3-4 code path")
 
-    # Load using original loader (gets pre-computed bio_targets.npz, proper trial groups)
-    session_data = phase34.load_session(processed_dir, model_dir, subject_id, hidden_dim)
-    if session_data is None:
-        log.error("  FAILED: Could not load session data for sub-%s", subject_id)
-        log.error("  Check: processed_dir=%s, model_dir=%s, h=%d",
-                  processed_dir, model_dir, hidden_dim)
-        return None, None
+def _filter_dead_neurons(H_trained, H_untrained, threshold=1e-10):
+    """Filter out zero-variance columns from BOTH matrices using same mask.
 
-    log.info("  H_trained: %s", session_data['H_trained'].shape)
-    log.info("  H_untrained: %s", session_data['H_untrained'].shape)
-    log.info("  Bio targets: %s (%d variables)",
-             session_data['bio_targets'].shape, len(session_data['bio_names']))
-    log.info("  Trial groups: %d unique", len(np.unique(session_data['trial_groups'])))
-    log.info("  CC: %.3f", session_data['model_info'].get('output_cc', 0))
+    Bug C fix: trained MLPs have ~50% dead ReLU neurons. Remove them from
+    BOTH trained and untrained to ensure symmetric feature spaces.
+    """
+    var_trained = np.std(H_trained, axis=0)
+    var_untrained = np.std(H_untrained, axis=0)
+    alive = (var_trained > threshold) | (var_untrained > threshold)
+    n_dead = int((~alive).sum())
+    n_total = len(alive)
+    if n_dead > 0:
+        log.info("    Filtered %d/%d dead neurons (%.0f%% alive)",
+                 n_dead, n_total, 100 * alive.sum() / n_total)
+    return H_trained[:, alive], H_untrained[:, alive], alive
 
-    # Run original Phase 3 probing
-    log.info("  Running original Phase 3 probing (all %d variables)...",
-             len(session_data['bio_names']))
-    phase3_results = phase34.run_phase3(session_data)
 
-    # Check theta_gamma_pac
-    pac_result = phase3_results.get('theta_gamma_pac', {})
-    pac_ridge = pac_result.get('ridge', {})
-    pac_dr2 = pac_ridge.get('delta_r2', 0)
-    log.info("  theta_gamma_pac: dR2=%.4f (trained=%.4f, untrained=%.4f)",
-             pac_dr2, pac_ridge.get('r2_trained', 0), pac_ridge.get('r2_untrained', 0))
+def _extract_mandatory(phase4_results):
+    """Extract mandatory variable names from Phase 4 results.
 
-    # Run Phase 4 ablation on candidates
-    log.info("  Running original Phase 4 ablation...")
-    phase4_results = phase34.run_phase4(session_data, phase3_results)
-
-    # Check theta_gamma_pac ablation
-    pac_abl = phase4_results.get('theta_gamma_pac', {})
-    if pac_abl:
-        log.info("  theta_gamma_pac ablation: %s", pac_abl.get('overall_verdict', 'N/A'))
-        for k, v in pac_abl.get('per_k', {}).items():
-            log.info("    k=%s: z=%.2f %s", k, v.get('z_score', 0), v.get('verdict', ''))
-
-    # Summary of mandatory variables
+    Bug A fix: Phase 4 nests verdict under 'resample_ablation' key.
+    """
     mandatory = []
     for vname, vresult in phase4_results.items():
-        if isinstance(vresult, dict) and vresult.get('overall_verdict') == 'MANDATORY':
+        if not isinstance(vresult, dict):
+            continue
+        # Phase 4 returns {vname: {'resample_ablation': {...}, 'epoch_ablation': {...}}}
+        abl = vresult.get('resample_ablation', vresult)
+        if abl.get('overall_verdict') == 'MANDATORY':
             mandatory.append(vname)
-    log.info("  MANDATORY variables: %s",
+    return mandatory
+
+
+def _probe_architecture_with_original_pipeline(arch_name, H_trained, H_untrained,
+                                                 session_data, phase34_module):
+    """Probe one architecture using the EXACT same Phase 3-4 functions.
+
+    Bug B fix: ONE probing code path for ALL architectures. Creates a
+    synthetic session_data dict with the MLP's hidden states but the
+    original bio targets, trial groups, and epoch masks.
+    """
+    # Filter dead neurons (Bug C)
+    H_tr_filt, H_un_filt, alive_mask = _filter_dead_neurons(H_trained, H_untrained)
+
+    log.info("  === Architecture: %s ===", arch_name)
+    log.info("    H_trained: %s -> %s after filtering",
+             H_trained.shape, H_tr_filt.shape)
+    log.info("    H_untrained: %s -> %s",
+             H_untrained.shape, H_un_filt.shape)
+
+    # Build synthetic session_data with MLP hidden states but original bio data
+    n_mlp = H_tr_filt.shape[0]
+    n_orig = session_data['bio_targets'].shape[0]
+    n = min(n_mlp, n_orig)
+
+    arch_session = {
+        'H_trained': H_tr_filt[:n].astype(np.float64),
+        'H_untrained': H_un_filt[:n].astype(np.float64),
+        'bio_targets': session_data['bio_targets'][:n],
+        'bio_names': session_data['bio_names'],
+        'epoch_mask': session_data['epoch_mask'][:n],
+        'trial_groups': session_data['trial_groups'][:n],
+        'meta': session_data['meta'],
+        'model_info': session_data['model_info'],
+        'hidden_dim': H_tr_filt.shape[1],
+    }
+
+    log.info("    Aligned samples: %d (MLP=%d, original=%d)", n, n_mlp, n_orig)
+
+    # Call the EXACT same Phase 3 probing
+    p3 = phase34_module.run_phase3(arch_session)
+
+    # Call the EXACT same Phase 4 ablation
+    p4 = phase34_module.run_phase4(arch_session, p3)
+
+    mandatory = _extract_mandatory(p4)
+    log.info("    MANDATORY: %s",
              ', '.join(mandatory) if mandatory else 'NONE')
 
-    if not mandatory:
-        log.warning("  WARNING: No mandatory variables found by original pipeline.")
-        log.warning("  If this subject was previously non-zombie, something has changed.")
-    else:
-        log.info("  LSTM baseline VALIDATED — %d mandatory variables found", len(mandatory))
-
-    log.info("=== LSTM BASELINE VALIDATION COMPLETE ===")
-
-    return session_data, phase3_results, phase4_results
+    return {
+        'architecture': arch_name,
+        'phase3': p3,
+        'phase4': p4,
+        'mandatory': mandatory,
+        'n_samples': n,
+        'hidden_dim_raw': H_trained.shape[1],
+        'hidden_dim_filtered': H_tr_filt.shape[1],
+        'n_dead_neurons': int((~alive_mask).sum()),
+    }
 
 
 def run_phase1(args):
     """Phase 1: Architecture control (GPU).
 
-    Step 1: Validate LSTM baseline using the EXACT original Phase 3-4 code.
-    Step 2: Run MLP/PySR architecture comparison using the original bio targets
-            and the original probing functions.
+    ONE probing function for ALL architectures — imported from run_kyzar_phase3_4.py.
+    The ONLY difference between LSTM and MLP is the hidden state matrix.
     """
     log.info("=" * 60)
     log.info("PHASE 1: ARCHITECTURE CONTROL")
+    log.info("  ONE probing path for all architectures")
     log.info("=" * 60)
 
-    # Step 1: Run original Phase 3-4 on this subject as the LSTM baseline
-    validation = validate_lstm_baseline_original(
-        args.processed_dir, args.model_dir, args.subject)
+    phase34 = _import_phase34()
 
-    if validation is None:
-        log.error("LSTM baseline validation failed — cannot proceed with P1")
-        return {'decision': 'ERROR', 'reasoning': 'LSTM baseline validation failed'}
+    # Step 1: Load original session data + run LSTM baseline
+    log.info("\n--- STEP 1: LSTM BASELINE (original Phase 3-4) ---")
+    session_data = phase34.load_session(
+        args.processed_dir, args.model_dir, args.subject, hidden_dim=64)
 
-    session_data, phase3_results, phase4_results = validation
+    if session_data is None:
+        log.error("Cannot load session data for sub-%s", args.subject)
+        return {'decision': 'ERROR', 'reasoning': 'Session data not found'}
 
-    # Extract the original bio targets and probing data for MLP comparison
-    # The LSTM results are already computed by the original pipeline above.
-    # Now we need to run MLP architectures using the SAME targets and groups.
-    from descartes.council_controls.priority1_architecture.run_p1_control import (
-        run_p1_control)
+    log.info("  Loaded sub-%s: H=%s, %d bio vars, %d trials, CC=%.3f",
+             args.subject, session_data['H_trained'].shape,
+             len(session_data['bio_names']),
+             len(np.unique(session_data['trial_groups'])),
+             session_data['model_info'].get('output_cc', 0))
 
-    # Build circuit_data from the original session
+    # Run original Phase 3+4 on LSTM
+    log.info("  Running Phase 3 probing on LSTM...")
+    lstm_p3 = phase34.run_phase3(session_data)
+    log.info("  Running Phase 4 ablation on LSTM...")
+    lstm_p4 = phase34.run_phase4(session_data, lstm_p3)
+    lstm_mandatory = _extract_mandatory(lstm_p4)
+
+    log.info("  LSTM MANDATORY: %s",
+             ', '.join(lstm_mandatory) if lstm_mandatory else 'NONE')
+
+    if not lstm_mandatory:
+        log.warning("  WARNING: LSTM baseline found no mandatory variables.")
+        log.warning("  This subject may be a zombie, or Phase 2 needs re-running.")
+
+    # Step 2: Train + probe MLP architectures using SAME probing pipeline
+    log.info("\n--- STEP 2: MLP ARCHITECTURES ---")
+
+    # Load raw X, Y for MLP training
     sess_name = 'session_sub{}_ses2'.format(args.subject)
     data_dir = Path(args.processed_dir) / sess_name
     X_data = dict(np.load(data_dir / 'X_trials.npz'))
     Y_data = dict(np.load(data_dir / 'Y_trials.npz'))
 
-    # Concatenate all trials (same order as original)
     meta = session_data['meta']
     X_list, Y_list = [], []
     for ti in range(meta['n_trials']):
@@ -311,48 +354,155 @@ def run_phase1(args):
     X_seq = np.concatenate(X_list, axis=0).astype(np.float32)
     Y_seq = np.concatenate(Y_list, axis=0).astype(np.float32)
 
-    # Use the ORIGINAL bio targets (from bio_targets.npz, not recomputed)
-    bio_names = session_data['bio_names']
-    bio_targets_mat = session_data['bio_targets']  # (T, 18)
-    original_targets = {}
-    for vi, vname in enumerate(bio_names):
-        original_targets[vname] = bio_targets_mat[:, vi]
+    from descartes.council_controls.priority1_architecture.run_p1_control import (
+        _train_mlp_architecture)
 
-    circuit_data = {
-        'C6_sub{}'.format(args.subject): {
-            'X': X_seq, 'Y': Y_seq,
-            'trial_size': int(np.mean([x.shape[0] for x in X_list])),
-        }
+    MLP_WINDOWS = [50, 100, 200, 500]
+    all_arch_results = []
+
+    # LSTM result
+    all_arch_results.append({
+        'architecture': 'LSTM',
+        'mandatory': lstm_mandatory,
+        'phase3': lstm_p3,
+        'phase4': lstm_p4,
+        'n_samples': session_data['H_trained'].shape[0],
+        'hidden_dim_raw': session_data['H_trained'].shape[1],
+        'hidden_dim_filtered': session_data['H_trained'].shape[1],
+        'n_dead_neurons': 0,
+    })
+
+    for window_ms in MLP_WINDOWS:
+        log.info("\n  Training MLP-%dms...", window_ms)
+        try:
+            H_tr, H_un, out_pred, test_r2, w_bins = _train_mlp_architecture(
+                X_seq, Y_seq, window_ms, dt_ms=10.0, device=args.device)
+
+            # CRITICAL: align to match original bio targets
+            # MLP hidden state[i] corresponds to input timestep (i + w_bins - 1)
+            # Original bio targets start at timestep 0
+            # Slice bio targets to start at (w_bins - 1) to align
+            offset = w_bins - 1
+            log.info("    Output R2: %.3f, offset: %d timesteps", test_r2, offset)
+
+            # Create offset session_data
+            n_mlp = H_tr.shape[0]
+            n_orig = session_data['bio_targets'].shape[0]
+            n = min(n_mlp, n_orig - offset)
+
+            if n < 200:
+                log.warning("    Too few aligned samples (%d) — skipping", n)
+                continue
+
+            offset_session = {
+                'H_trained': session_data['H_trained'],  # placeholder, replaced below
+                'H_untrained': session_data['H_untrained'],
+                'bio_targets': session_data['bio_targets'][offset:offset + n],
+                'bio_names': session_data['bio_names'],
+                'epoch_mask': session_data['epoch_mask'][offset:offset + n],
+                'trial_groups': session_data['trial_groups'][offset:offset + n],
+                'meta': session_data['meta'],
+                'model_info': {'output_cc': float(np.sqrt(max(test_r2, 0)))},
+                'hidden_dim': H_tr.shape[1],
+            }
+
+            result = _probe_architecture_with_original_pipeline(
+                'MLP_{}ms'.format(window_ms),
+                H_tr[:n], H_un[:n],
+                offset_session, phase34)
+            result['output_r2'] = test_r2
+            result['window_offset'] = offset
+            all_arch_results.append(result)
+
+        except Exception as e:
+            log.error("    MLP-%dms failed: %s", window_ms, e)
+            import traceback
+            traceback.print_exc()
+            continue
+
+    # Step 3: Build comparison table
+    log.info("\n--- STEP 3: ARCHITECTURE COMPARISON ---")
+    log.info("%-15s | %-8s | %-6s | Mandatory Variables", "Architecture", "Samples", "H_dim")
+    log.info("-" * 70)
+    for r in all_arch_results:
+        mvars = ', '.join(r['mandatory']) if r['mandatory'] else 'NONE'
+        log.info("%-15s | %-8d | %-6d | %s",
+                 r['architecture'], r['n_samples'],
+                 r['hidden_dim_filtered'], mvars)
+
+    # Decision logic
+    non_lstm = [r for r in all_arch_results if r['architecture'] != 'LSTM']
+    all_mandatory = set()
+    for r in all_arch_results:
+        all_mandatory.update(r['mandatory'])
+
+    architecture_invariant = []
+    lstm_specific = []
+    for vname in all_mandatory:
+        in_lstm = vname in lstm_mandatory
+        n_non_lstm = sum(1 for r in non_lstm if vname in r['mandatory'])
+        if n_non_lstm >= 2:
+            architecture_invariant.append(vname)
+        elif in_lstm and n_non_lstm == 0:
+            lstm_specific.append(vname)
+
+    if architecture_invariant:
+        decision = 'PASS'
+        reasoning = ('{} variable(s) architecture-invariant: {}. '
+                     'Genuine biophysical encoding confirmed.'.format(
+                         len(architecture_invariant), architecture_invariant))
+    elif lstm_specific:
+        decision = 'FAIL'
+        reasoning = ('All mandatory variables are LSTM-specific: {}. '
+                     'May be architecture artifacts.'.format(lstm_specific))
+    else:
+        decision = 'INCONCLUSIVE'
+        reasoning = ('No mandatory variables found in any architecture, '
+                     'or insufficient non-LSTM architectures tested.')
+
+    log.info("\n" + "=" * 60)
+    log.info("P1 DECISION: %s", decision)
+    log.info("  Architecture-invariant: %s", architecture_invariant)
+    log.info("  LSTM-specific: %s", lstm_specific)
+    log.info("  Reasoning: %s", reasoning)
+    log.info("=" * 60)
+
+    # Save results
+    output = {
+        'decision': decision,
+        'reasoning': reasoning,
+        'architecture_invariant': architecture_invariant,
+        'lstm_specific': lstm_specific,
+        'subject': args.subject,
+        'per_architecture': [{
+            'architecture': r['architecture'],
+            'mandatory': r['mandatory'],
+            'n_samples': r['n_samples'],
+            'hidden_dim_raw': r.get('hidden_dim_raw', 0),
+            'hidden_dim_filtered': r.get('hidden_dim_filtered', 0),
+            'n_dead_neurons': r.get('n_dead_neurons', 0),
+        } for r in all_arch_results],
     }
 
-    # Step 2: Run P1 architecture comparison with ORIGINAL targets
-    # Include LSTM hidden states from original pipeline
-    result = run_p1_control(
-        circuit_data=circuit_data,
-        targets=original_targets,
-        results_dir='results/council_controls',
-        dt_ms=10.0,
-        device=args.device,
-        include_lstm=True,
-        lstm_hidden_trained=session_data['H_trained'],
-        lstm_hidden_untrained=session_data['H_untrained'],
-        lstm_output_pred=np.zeros((len(session_data['H_trained']), Y_seq.shape[1])),
-        lstm_output_r2=session_data['model_info'].get('output_cc', 0) ** 2,
-    )
+    results_dir = Path('results/council_controls')
+    results_dir.mkdir(parents=True, exist_ok=True)
 
-    # Attach original Phase 3-4 results for comparison
-    result['original_phase3'] = {vname: {
-        'ridge_dr2': r.get('ridge', {}).get('delta_r2', 0),
-        'mlp_dr2': r.get('mlp', {}).get('delta_r2', 0),
-    } for vname, r in phase3_results.items()}
-    result['original_phase4_mandatory'] = [
-        vname for vname, r in phase4_results.items()
-        if isinstance(r, dict) and r.get('overall_verdict') == 'MANDATORY'
-    ]
+    import json as _json
 
-    log.info("Phase 1 decision: %s", result.get('decision', 'UNKNOWN'))
-    log.info("Original Phase 3-4 mandatory: %s", result['original_phase4_mandatory'])
-    return result
+    class _NpEnc(_json.JSONEncoder):
+        def default(self, obj):
+            if isinstance(obj, (np.integer,)):
+                return int(obj)
+            if isinstance(obj, (np.floating,)):
+                return float(obj)
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            return super().default(obj)
+
+    with open(results_dir / 'p1_architecture_control.json', 'w') as f:
+        _json.dump(output, f, indent=2, cls=_NpEnc)
+
+    return output
 
 
 def run_phase3(args):
