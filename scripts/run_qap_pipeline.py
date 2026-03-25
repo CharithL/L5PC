@@ -202,20 +202,30 @@ def _import_phase34():
 
 
 def _filter_dead_neurons(H_trained, H_untrained, threshold=1e-10):
-    """Filter out zero-variance columns from BOTH matrices using same mask.
+    """Filter out zero-variance columns using INTERSECTION of alive neurons.
 
-    Bug C fix: trained MLPs have ~50% dead ReLU neurons. Remove them from
-    BOTH trained and untrained to ensure symmetric feature spaces.
+    Uses AND (not OR) to keep only columns alive in BOTH trained AND untrained.
+    This prevents sparsity asymmetry where untrained has more non-zero columns
+    than trained (giving Ridge more degrees of freedom for untrained, inflating
+    untrained R² and producing spurious negative ΔR²).
     """
     var_trained = np.std(H_trained, axis=0)
     var_untrained = np.std(H_untrained, axis=0)
-    alive = (var_trained > threshold) | (var_untrained > threshold)
-    n_dead = int((~alive).sum())
-    n_total = len(alive)
-    if n_dead > 0:
-        log.info("    Filtered %d/%d dead neurons (%.0f%% alive)",
-                 n_dead, n_total, 100 * alive.sum() / n_total)
-    return H_trained[:, alive], H_untrained[:, alive], alive
+    alive_trained = var_trained > threshold
+    alive_untrained = var_untrained > threshold
+    alive_both = alive_trained & alive_untrained  # INTERSECTION, not union
+
+    n_dead_trained = int((~alive_trained).sum())
+    n_dead_untrained = int((~alive_untrained).sum())
+    n_kept = int(alive_both.sum())
+    n_total = len(alive_both)
+
+    log.info("    Dead neurons: trained=%d, untrained=%d (of %d total)",
+             n_dead_trained, n_dead_untrained, n_total)
+    log.info("    Keeping %d/%d columns alive in BOTH (intersection)",
+             n_kept, n_total)
+
+    return H_trained[:, alive_both], H_untrained[:, alive_both], alive_both
 
 
 def _extract_mandatory(phase4_results):

@@ -155,15 +155,24 @@ def mlp_delta_r2(H_trained, H_untrained, target, groups):
     if np.std(target) < 1e-10:
         return {'r2_trained': 0.0, 'r2_untrained': 0.0, 'delta_r2': 0.0}
 
+    # Sanitize inputs — NaN/Inf from dead neurons cause MLP explosions
+    H_tr = np.nan_to_num(H_trained, nan=0.0, posinf=0.0, neginf=0.0)
+    H_un = np.nan_to_num(H_untrained, nan=0.0, posinf=0.0, neginf=0.0)
+    tgt = np.nan_to_num(target, nan=0.0, posinf=0.0, neginf=0.0)
+
     mlp = MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=500,
                        early_stopping=True, random_state=42)
     r2_t = float(np.mean(cross_val_score(
-        mlp, H_trained, target, cv=gkf, groups=groups, scoring='r2', n_jobs=-1)))
+        mlp, H_tr, tgt, cv=gkf, groups=groups, scoring='r2', n_jobs=-1)))
 
     mlp_u = MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=500,
                          early_stopping=True, random_state=42)
     r2_u = float(np.mean(cross_val_score(
-        mlp_u, H_untrained, target, cv=gkf, groups=groups, scoring='r2', n_jobs=-1)))
+        mlp_u, H_un, tgt, cv=gkf, groups=groups, scoring='r2', n_jobs=-1)))
+
+    # Clamp to sane range — R² outside [-2, 1] indicates numerical garbage
+    r2_t = float(np.clip(r2_t, -2.0, 1.0))
+    r2_u = float(np.clip(r2_u, -2.0, 1.0))
 
     return {'r2_trained': r2_t, 'r2_untrained': r2_u, 'delta_r2': r2_t - r2_u}
 
