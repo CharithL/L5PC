@@ -216,8 +216,8 @@ def verify_transform(original_trials, transformed_trials, condition_name, dt_ms=
     # Condition-specific validation
     if condition_name == 'SPATIAL_ONLY':
         verification['preserves_coactivation'] = pairwise_corr > 0.5
-        verification['destroys_timing'] = theta_ratio < 0.5
-        verification['valid'] = verification['preserves_coactivation']
+        verification['destroys_timing'] = theta_ratio < 0.10  # Tightened: full-trial shuffle should be < 0.05
+        verification['valid'] = verification['preserves_coactivation'] and verification['destroys_timing']
     elif condition_name == 'PURE_NOISE':
         verification['valid'] = True
     else:  # SEQUENTIAL
@@ -237,10 +237,21 @@ def condition_sequential(trials):
 
 
 def condition_spatial_only(trials, rng):
-    """Preserve co-activation patterns, destroy timing via 200ms window shuffles."""
-    log.info("  Condition: SPATIAL_ONLY (preserve co-activation, destroy timing)")
-    dt_ms = 10
-    window_size = int(200 / dt_ms)  # 20 timesteps
+    """Preserve co-activation patterns, destroy ALL temporal structure.
+
+    For each trial, randomly permute ALL timesteps across the entire trial.
+    Each row (spatial pattern across neurons at one timestep) is preserved
+    intact, but the temporal order is completely randomized.
+
+    This destroys: theta, gamma, PAC, ISI patterns, any temporal correlation.
+    This preserves: which neurons co-activate (spatial correlation structure),
+    mean firing rates, variance.
+
+    Previous v2 bug: 200ms window shuffles preserved theta-scale temporal
+    structure (theta power ratio=0.268). Full-trial permutation should
+    drive theta power ratio below 0.05.
+    """
+    log.info("  Condition: SPATIAL_ONLY (preserve co-activation, destroy ALL timing)")
 
     new_trials = []
     for t in trials:
@@ -248,23 +259,23 @@ def condition_spatial_only(trials, rng):
         Y = t['Y'].copy()
         T = X.shape[0]
 
-        X_perm = X.copy()
-        Y_perm = Y.copy()
-        for start in range(0, T, window_size):
-            end = min(start + window_size, T)
-            perm = rng.permutation(end - start) + start
-            X_perm[start:end] = X[perm]
-            Y_perm[start:end] = Y[perm]
+        # Permute ALL timesteps across the entire trial
+        perm = rng.permutation(T)
+        X_perm = X[perm]
+        Y_perm = Y[perm]
+
+        # Epoch labels also permuted (temporal structure destroyed)
+        epoch_perm = t['epoch'].copy()[perm]
 
         new_trials.append({
             'X': X_perm.astype(np.float32),
             'Y': Y_perm.astype(np.float32),
-            'epoch': t['epoch'].copy(),
+            'epoch': epoch_perm,
             'meta': t.get('meta', {}),
         })
 
-    log.info("    %d trials: timesteps permuted within %dms windows",
-             len(new_trials), window_size * dt_ms)
+    log.info("    %d trials: ALL timesteps permuted across full trial length",
+             len(new_trials))
     return new_trials
 
 
@@ -705,6 +716,13 @@ def resample_ablation(H_trained, target, groups, n_resamples=20, rng=None):
 # FULL CONDITION PIPELINE (v3: iAAFT screening replaces delta-R-squared)
 # =========================================================================
 
+CONDITION_SEEDS = {
+    'SEQUENTIAL': 42,
+    'SPATIAL_ONLY': 137,
+    'PURE_NOISE': 271,
+}
+
+
 def run_condition(condition_name, trials, original_trials, hidden_dim,
                   device, rng, output_dir, n_surrogates=50):
     """Full pipeline: verify -> train -> iAAFT screen -> ablate survivors."""
@@ -721,12 +739,15 @@ def run_condition(condition_name, trials, original_trials, hidden_dim,
     n_in = trials[0]['X'].shape[1]
     n_out = trials[0]['Y'].shape[1]
 
-    # --- TRAIN ---
+    # --- TRAIN (condition-specific seed to ensure independent initialization) ---
     X_data, Y_data = trials_to_npz(trials)
     train_idx, test_idx = gap_cv_split(n_trials)
 
-    log.info("  Training LSTM (h=%d) on %d trials...", hidden_dim, n_trials)
-    torch.manual_seed(42)
+    cond_seed = CONDITION_SEEDS.get(condition_name, hash(condition_name) % 10000)
+    log.info("  Training LSTM (h=%d) on %d trials (seed=%d)...",
+             hidden_dim, n_trials, cond_seed)
+    torch.manual_seed(cond_seed)
+    np.random.seed(cond_seed)  # Also reset numpy for any stochastic data loading
     model = LSTMSurrogate(n_in, n_out, hidden_dim).to(device)
     model, cc, n_epochs = train_model(
         model, X_data, Y_data, train_idx, test_idx, device=device)
