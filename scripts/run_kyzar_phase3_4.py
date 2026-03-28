@@ -222,6 +222,256 @@ def epoch_specific_probe(H_trained, H_untrained, target, epoch_mask,
     return epoch_results
 
 
+# =========================================================================
+# iAAFT SCREENING (for MLP architectures — replaces ΔR² with R²_trained)
+# =========================================================================
+
+def iaaft_surrogate(signal, n_iterations=100, rng=None):
+    """Generate an iAAFT surrogate preserving power spectrum + amplitude dist."""
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    n = len(signal)
+    fft_orig = np.fft.rfft(signal)
+    amplitudes = np.abs(fft_orig)
+    sorted_original = np.sort(signal)
+
+    # Initial: random phase
+    random_phases = rng.uniform(0, 2 * np.pi, size=len(fft_orig))
+    random_phases[0] = 0
+    if n % 2 == 0:
+        random_phases[-1] = 0
+
+    surrogate = np.fft.irfft(amplitudes * np.exp(1j * random_phases), n=n)
+
+    for _ in range(n_iterations):
+        rank_order = np.argsort(np.argsort(surrogate))
+        surrogate = sorted_original[rank_order]
+        fft_surr = np.fft.rfft(surrogate)
+        phases_surr = np.angle(fft_surr)
+        surrogate = np.fft.irfft(amplitudes * np.exp(1j * phases_surr), n=n)
+
+    return surrogate
+
+
+def iaaft_screen_r2_trained(H_trained, target, groups, n_surrogates=50,
+                             alpha=1.0, random_state=42, r2_floor=0.01):
+    """Screen R²_trained against iAAFT null distribution with dual gate.
+
+    For MLP architectures, ΔR² (trained - untrained) is inappropriate because
+    untrained MLPs are random linear projections that preserve input statistics.
+    Instead, we apply a DUAL screening gate:
+      1. Statistical: R²_trained > 95th percentile of iAAFT null (p < 0.05)
+      2. Effect size: R²_trained > r2_floor (default 0.01)
+
+    Both conditions must be met to pass screening. The iAAFT test controls for
+    temporal autocorrelation; the R² floor prevents trivially small effect sizes
+    from reaching the expensive resample ablation step.
+
+    Returns
+    -------
+    dict with keys:
+        r2_trained : float — observed R² on real target
+        iaaft_threshold : float — 95th percentile of iAAFT null
+        iaaft_p : float — p-value (fraction of surrogates >= observed)
+        r2_floor : float — minimum R² threshold for effect size gate
+        passes_iaaft : bool — True if r2_trained > 95th percentile (p < 0.05)
+        passes_r2_floor : bool — True if r2_trained > r2_floor
+        passes_screen : bool — True if BOTH gates passed
+        null_r2s : list — surrogate R² values for transparency
+    """
+    rng = np.random.default_rng(random_state)
+
+    _fail = {
+        'r2_trained': 0.0, 'iaaft_threshold': 0.0, 'iaaft_p': 1.0,
+        'r2_floor': r2_floor, 'passes_iaaft': False,
+        'passes_r2_floor': False, 'passes_screen': False, 'null_r2s': [],
+    }
+
+    if np.std(target) < 1e-10:
+        return _fail
+
+    n_groups = len(np.unique(groups))
+    n_splits = min(5, n_groups)
+    if n_splits < 2:
+        return _fail
+
+    gkf = GroupKFold(n_splits=n_splits)
+
+    # Observed R²_trained on real target
+    r2_trained = float(np.mean(cross_val_score(
+        Ridge(alpha), H_trained, target, cv=gkf, groups=groups,
+        scoring='r2', n_jobs=-1)))
+
+    # Build iAAFT null: for each surrogate target, compute R²
+    null_r2s = []
+    for si in range(n_surrogates):
+        surr_target = iaaft_surrogate(target, rng=rng)
+        if np.std(surr_target) < 1e-10:
+            null_r2s.append(0.0)
+            continue
+        surr_r2 = float(np.mean(cross_val_score(
+            Ridge(alpha), H_trained, surr_target, cv=gkf, groups=groups,
+            scoring='r2', n_jobs=-1)))
+        null_r2s.append(surr_r2)
+
+    null_r2s = np.array(null_r2s)
+    threshold_95 = float(np.percentile(null_r2s, 95))
+    p_value = float(np.mean(null_r2s >= r2_trained))
+
+    passes_iaaft = r2_trained > threshold_95
+    passes_r2_floor = r2_trained > r2_floor
+
+    return {
+        'r2_trained': r2_trained,
+        'iaaft_threshold': threshold_95,
+        'iaaft_p': p_value,
+        'r2_floor': r2_floor,
+        'passes_iaaft': passes_iaaft,
+        'passes_r2_floor': passes_r2_floor,
+        'passes_screen': passes_iaaft and passes_r2_floor,  # DUAL GATE
+        'null_r2s': null_r2s.tolist(),
+    }
+
+
+def run_phase3_iaaft(session_data, n_surrogates=50):
+    """Phase 3 for MLP architectures: iAAFT screening on R²_trained.
+
+    Replaces ΔR² screening with iAAFT-based screening. Variables where
+    R²_trained > 95th percentile of iAAFT null proceed to Phase 4.
+    """
+    H_t = session_data['H_trained']
+    bio = session_data['bio_targets']
+    names = session_data['bio_names']
+    groups = session_data['trial_groups']
+    epoch_mask = session_data['epoch_mask']
+
+    results = {}
+
+    for vi, vname in enumerate(names):
+        target = bio[:, vi]
+        log.info("    [iAAFT] Probing %s (%d/%d)...", vname, vi + 1, len(names))
+
+        # iAAFT screening on R²_trained (replaces ΔR² for MLPs)
+        iaaft = iaaft_screen_r2_trained(H_t, target, groups,
+                                         n_surrogates=n_surrogates)
+
+        # Also compute raw R²_trained for epoch-specific (no untrained needed)
+        # Epoch-specific probing uses R²_trained only
+        epoch_results = {}
+        for epoch_code, epoch_name in EPOCH_NAMES.items():
+            mask = epoch_mask == epoch_code
+            n_samples = np.sum(mask)
+            if n_samples < 200:
+                epoch_results[epoch_name] = {
+                    'n_samples': int(n_samples), 'r2_trained': 0.0, 'skipped': True}
+                continue
+            ht_ep = H_t[mask]
+            tgt_ep = target[mask]
+            grp_ep = groups[mask]
+            n_unique = len(np.unique(grp_ep))
+            n_splits = min(5, n_unique)
+            if n_splits < 2 or np.std(tgt_ep) < 1e-10:
+                epoch_results[epoch_name] = {
+                    'n_samples': int(n_samples), 'r2_trained': 0.0, 'skipped': True}
+                continue
+            gkf = GroupKFold(n_splits=n_splits)
+            r2_t = float(np.mean(cross_val_score(
+                Ridge(1.0), ht_ep, tgt_ep, cv=gkf, groups=grp_ep,
+                scoring='r2', n_jobs=-1)))
+            epoch_results[epoch_name] = {
+                'n_samples': int(n_samples), 'r2_trained': r2_t}
+
+        # Raw correlation profile
+        hdim = H_t.shape[1]
+        n_check = min(hdim, 128)
+        corrs = [abs(np.corrcoef(H_t[:, d], target)[0, 1])
+                 for d in range(n_check)]
+        max_r = float(max(corrs)) if corrs else 0.0
+        n_corr_dims = int(sum(1 for c in corrs if c > 0.3))
+
+        results[vname] = {
+            'iaaft': iaaft,
+            'epoch_specific': epoch_results,
+            'max_abs_r': max_r,
+            'n_dims_above_0.3': n_corr_dims,
+            # Compatibility keys for logging
+            'ridge': {
+                'r2_trained': iaaft['r2_trained'],
+                'r2_untrained': 0.0,  # not computed for MLPs
+                'delta_r2': iaaft['r2_trained'],  # for display only
+            },
+            'mlp': {'r2_trained': 0.0, 'r2_untrained': 0.0, 'delta_r2': 0.0},
+        }
+
+        if iaaft['passes_screen']:
+            status = "PASS (both gates)"
+        elif iaaft.get('passes_iaaft') and not iaaft.get('passes_r2_floor'):
+            status = "FAIL (R²<%.3f)" % iaaft.get('r2_floor', 0.01)
+        elif iaaft.get('passes_r2_floor') and not iaaft.get('passes_iaaft'):
+            status = "FAIL (p=%.3f)" % iaaft['iaaft_p']
+        else:
+            status = "FAIL (both gates)"
+        log.info("      R2_trained=%.4f  iAAFT_95th=%.4f  p=%.3f  [%s]  max|r|=%.3f",
+                 iaaft['r2_trained'], iaaft['iaaft_threshold'],
+                 iaaft['iaaft_p'], status, max_r)
+
+    return results
+
+
+def run_phase4_iaaft(session_data, phase3_iaaft_results):
+    """Phase 4 for MLP architectures: resample ablation on iAAFT-screened variables.
+
+    Variables proceed to ablation if R²_trained > iAAFT 95th percentile
+    (instead of the ΔR² > 0.05 threshold used for LSTMs).
+    """
+    H_t = session_data['H_trained']
+    bio = session_data['bio_targets']
+    names = session_data['bio_names']
+    groups = session_data['trial_groups']
+    epoch_mask = session_data['epoch_mask']
+
+    # Select candidates: variables that passed iAAFT screening
+    candidates = []
+    for vi, vname in enumerate(names):
+        p3 = phase3_iaaft_results.get(vname, {})
+        iaaft = p3.get('iaaft', {})
+        if iaaft.get('passes_screen', False):
+            candidates.append((vi, vname))
+
+    log.info("  Phase 4 (iAAFT): %d/%d variables passed iAAFT screening",
+             len(candidates), len(names))
+
+    results = {}
+    rng = np.random.default_rng(42)
+
+    for vi, vname in candidates:
+        target = bio[:, vi]
+        log.info("    Ablating %s...", vname)
+
+        # Full resample ablation (same as LSTM path)
+        abl = resample_ablation(H_t, target, groups, rng=rng)
+
+        # Epoch-specific ablation
+        ep_abl = epoch_specific_ablation(
+            H_t, target, epoch_mask, groups, rng=rng)
+
+        results[vname] = {
+            'resample_ablation': abl,
+            'epoch_ablation': ep_abl,
+        }
+
+        log.info("      Overall: %s (causal at %d k-values)",
+                 abl['overall_verdict'], abl['n_causal_k'])
+        for ep_name, ep_res in ep_abl.items():
+            if not ep_res.get('skipped'):
+                log.info("        %s: z=%.2f %s",
+                         ep_name, ep_res.get('z_score', 0),
+                         ep_res.get('verdict', ''))
+
+    return results
+
+
 def run_phase3(session_data):
     """Run all Phase 3 probes on one session."""
     H_t = session_data['H_trained']

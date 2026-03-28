@@ -37,9 +37,13 @@ Usage:
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from pathlib import Path
+
+# Ensure the L5PC root (parent of scripts/) is on sys.path so 'descartes' is importable
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 
@@ -246,25 +250,23 @@ def _extract_mandatory(phase4_results):
 
 def _probe_architecture_with_original_pipeline(arch_name, H_trained, H_untrained,
                                                  session_data, phase34_module):
-    """Probe one architecture using the EXACT same Phase 3-4 functions.
+    """Probe one architecture using iAAFT screening on R²_trained.
 
-    Bug B fix: ONE probing code path for ALL architectures. Creates a
-    synthetic session_data dict with the MLP's hidden states but the
-    original bio targets, trial groups, and epoch masks.
+    ALL architectures use the same screening method: iAAFT significance
+    (p < 0.05) AND R²_trained > 0.01 dual gate, followed by resample ablation.
+    This ensures valid cross-architecture comparison.
     """
-    # Filter dead neurons (Bug C)
+    # Filter dead neurons (intersection filter)
     H_tr_filt, H_un_filt, alive_mask = _filter_dead_neurons(H_trained, H_untrained)
 
-    log.info("  === Architecture: %s ===", arch_name)
+    log.info("  === Architecture: %s (iAAFT screening) ===", arch_name)
     log.info("    H_trained: %s -> %s after filtering",
              H_trained.shape, H_tr_filt.shape)
-    log.info("    H_untrained: %s -> %s",
-             H_untrained.shape, H_un_filt.shape)
 
-    # Build synthetic session_data with MLP hidden states but original bio data
-    n_mlp = H_tr_filt.shape[0]
+    # Build synthetic session_data with this architecture's hidden states
+    n_arch = H_tr_filt.shape[0]
     n_orig = session_data['bio_targets'].shape[0]
-    n = min(n_mlp, n_orig)
+    n = min(n_arch, n_orig)
 
     arch_session = {
         'H_trained': H_tr_filt[:n].astype(np.float64),
@@ -278,13 +280,12 @@ def _probe_architecture_with_original_pipeline(arch_name, H_trained, H_untrained
         'hidden_dim': H_tr_filt.shape[1],
     }
 
-    log.info("    Aligned samples: %d (MLP=%d, original=%d)", n, n_mlp, n_orig)
+    log.info("    Aligned samples: %d (arch=%d, original=%d)", n, n_arch, n_orig)
 
-    # Call the EXACT same Phase 3 probing
-    p3 = phase34_module.run_phase3(arch_session)
-
-    # Call the EXACT same Phase 4 ablation
-    p4 = phase34_module.run_phase4(arch_session, p3)
+    # ALL architectures: iAAFT screening on R²_trained (same method for valid comparison)
+    log.info("    Using iAAFT screening (50 surrogates per variable)...")
+    p3 = phase34_module.run_phase3_iaaft(arch_session, n_surrogates=50)
+    p4 = phase34_module.run_phase4_iaaft(arch_session, p3)
 
     mandatory = _extract_mandatory(p4)
     log.info("    MANDATORY: %s",
@@ -295,6 +296,7 @@ def _probe_architecture_with_original_pipeline(arch_name, H_trained, H_untrained
         'phase3': p3,
         'phase4': p4,
         'mandatory': mandatory,
+        'screening_method': 'iaaft_r2_trained',
         'n_samples': n,
         'hidden_dim_raw': H_trained.shape[1],
         'hidden_dim_filtered': H_tr_filt.shape[1],
@@ -316,7 +318,7 @@ def run_phase1(args):
     phase34 = _import_phase34()
 
     # Step 1: Load original session data + run LSTM baseline
-    log.info("\n--- STEP 1: LSTM BASELINE (original Phase 3-4) ---")
+    log.info("\n--- STEP 1: LSTM BASELINE (iAAFT screening) ---")
     session_data = phase34.load_session(
         args.processed_dir, args.model_dir, args.subject, hidden_dim=64)
 
@@ -330,18 +332,18 @@ def run_phase1(args):
              len(np.unique(session_data['trial_groups'])),
              session_data['model_info'].get('output_cc', 0))
 
-    # Run original Phase 3+4 on LSTM
-    log.info("  Running Phase 3 probing on LSTM...")
-    lstm_p3 = phase34.run_phase3(session_data)
-    log.info("  Running Phase 4 ablation on LSTM...")
-    lstm_p4 = phase34.run_phase4(session_data, lstm_p3)
+    # Run iAAFT Phase 3+4 on LSTM (same method as MLPs for valid comparison)
+    log.info("  Running Phase 3 iAAFT probing on LSTM...")
+    lstm_p3 = phase34.run_phase3_iaaft(session_data, n_surrogates=50)
+    log.info("  Running Phase 4 iAAFT ablation on LSTM...")
+    lstm_p4 = phase34.run_phase4_iaaft(session_data, lstm_p3)
     lstm_mandatory = _extract_mandatory(lstm_p4)
 
     log.info("  LSTM MANDATORY: %s",
              ', '.join(lstm_mandatory) if lstm_mandatory else 'NONE')
 
     if not lstm_mandatory:
-        log.warning("  WARNING: LSTM baseline found no mandatory variables.")
+        log.warning("  WARNING: LSTM found no mandatory variables with iAAFT screening.")
         log.warning("  This subject may be a zombie, or Phase 2 needs re-running.")
 
     # Step 2: Train + probe MLP architectures using SAME probing pipeline
@@ -370,12 +372,13 @@ def run_phase1(args):
     MLP_WINDOWS = [50, 100, 200, 500]
     all_arch_results = []
 
-    # LSTM result
+    # LSTM result (same iAAFT screening as MLPs)
     all_arch_results.append({
         'architecture': 'LSTM',
         'mandatory': lstm_mandatory,
         'phase3': lstm_p3,
         'phase4': lstm_p4,
+        'screening_method': 'iaaft_r2_trained',
         'n_samples': session_data['H_trained'].shape[0],
         'hidden_dim_raw': session_data['H_trained'].shape[1],
         'hidden_dim_filtered': session_data['H_trained'].shape[1],
@@ -432,13 +435,18 @@ def run_phase1(args):
 
     # Step 3: Build comparison table
     log.info("\n--- STEP 3: ARCHITECTURE COMPARISON ---")
-    log.info("%-15s | %-8s | %-6s | Mandatory Variables", "Architecture", "Samples", "H_dim")
-    log.info("-" * 70)
+    log.info("%-15s | %-8s | %-6s | %-12s | %-5s | Mandatory Variables",
+             "Architecture", "Samples", "H_dim", "Screen", "#Mand")
+    log.info("-" * 100)
     for r in all_arch_results:
         mvars = ', '.join(r['mandatory']) if r['mandatory'] else 'NONE'
-        log.info("%-15s | %-8d | %-6d | %s",
+        screen = r.get('screening_method', 'delta_r2')
+        if screen == 'iaaft_r2_trained':
+            screen = 'iAAFT+R²'
+        log.info("%-15s | %-8d | %-6d | %-12s | %-5d | %s",
                  r['architecture'], r['n_samples'],
-                 r['hidden_dim_filtered'], mvars)
+                 r['hidden_dim_filtered'], screen,
+                 len(r['mandatory']), mvars)
 
     # Decision logic
     non_lstm = [r for r in all_arch_results if r['architecture'] != 'LSTM']
