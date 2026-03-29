@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
 """
-Task-Dependence Test: Does firing_rate_input disappear when the output
+Task-Dependence Test v2: Does firing_rate_input disappear when the output
 format no longer contains firing rates?
 
 Uses sub-5 from Kyzar dataset. Same input spike trains for all three tasks.
 Only the prediction target changes.
 
-Task A: Spike prediction (output = 29 neurons) — CONTROL
-Task B: Accuracy prediction (output = scalar 0/1 per trial)
-Task C: Memory load prediction (output = one-hot set size 1/2/3 per trial)
+Task A:  Spike prediction (output = 29 neurons) — CONTROL
+Task B2: Output population mean rate (scalar per timestep — learnable,
+         but a scalar summary, not a spike train)
+Task C2: Temporal epoch prediction (5-class: fixation/encoding/maintenance/
+         probe/response — changes within trials, decodable from input dynamics)
+
+v1 Tasks B/C failed because constant per-trial labels (accuracy, load)
+gave no per-timestep gradient signal. v2 tasks vary within trials.
 
 Prediction:
   firing_rate_input is MANDATORY in Task A (tautological: output contains rates)
-  firing_rate_input DROPS OUT of Tasks B/C (output has no rate information)
+  firing_rate_input may SURVIVE Task B2 (output mean rate still contains rate info)
+    but at REDUCED R2 (scalar vs 29-neuron spike train)
+  firing_rate_input DROPS OUT of Task C2 (epoch has no rate information)
   theta_gamma_pac SURVIVES all tasks (reflects temporal world structure)
 
 CRITICAL: All probing functions imported from run_synthetic_reality_v3_iaaft.py.
@@ -65,8 +72,8 @@ log = logging.getLogger('task_dependence')
 # =========================================================================
 TASK_SEEDS = {
     'task_a': 42,
-    'task_b': 137,
-    'task_c': 271,
+    'task_b2': 137,
+    'task_c2': 271,
 }
 
 
@@ -74,51 +81,32 @@ TASK_SEEDS = {
 # STEP 1: Load data and extract behavioral labels
 # =========================================================================
 
-def load_sub5_with_behavior(processed_dir, subject='5'):
-    """Load sub-5 trials AND extract behavioral labels from metadata.
+def load_sub5_data(processed_dir, subject='5'):
+    """Load sub-5 trials from Kyzar processed data.
 
     Returns:
         trials: list of dicts with X, Y, epoch, meta (same as v3)
-        accuracy_labels: list of int (0 or 1 per trial)
-        load_labels: list of int (1, 2, or 3 per trial — set size)
         meta: full session metadata
     """
     trials, meta = load_source_data(processed_dir, subject)
-
-    trial_meta = meta.get('trial_metadata', [])
-    accuracy_labels = []
-    load_labels = []
-
-    for ti, t in enumerate(trials):
-        if ti < len(trial_meta):
-            tm = trial_meta[ti]
-            accuracy_labels.append(int(tm.get('accuracy', 0)))
-            load_labels.append(int(tm.get('load', 1)))
-        else:
-            # Fallback if metadata is missing for this trial
-            accuracy_labels.append(0)
-            load_labels.append(1)
-
-    accuracy_labels = np.array(accuracy_labels)
-    load_labels = np.array(load_labels)
-
-    log.info("Behavioral labels extracted:")
-    log.info("  Accuracy: %s", dict(zip(*np.unique(accuracy_labels, return_counts=True))))
-    log.info("  Load (set size): %s", dict(zip(*np.unique(load_labels, return_counts=True))))
-
-    return trials, accuracy_labels, load_labels, meta
+    return trials, meta
 
 
 # =========================================================================
-# STEP 2: Create time-expanded targets for Tasks B and C
+# STEP 2: Create time-varying targets for Tasks B2 and C2
 # =========================================================================
 
-def prepare_task_targets(trials, accuracy_labels, load_labels):
+def prepare_task_targets(trials):
     """Create three sets of training targets from the same input data.
 
-    Task A: output spike trains (unchanged from existing pipeline)
-    Task B: accuracy expanded to every timestep (T, 1) — constant per trial
-    Task C: load as one-hot expanded to every timestep (T, 3) — constant per trial
+    Task A:  output spike trains (29 neurons, unchanged)
+    Task B2: output population mean firing rate (scalar per timestep)
+             — learnable because it's a simplified version of Task A
+             — still contains rate information but as a scalar, not spike train
+    Task C2: temporal epoch identity (5-class one-hot per timestep)
+             — changes WITHIN each trial (fixation->encoding->maintenance->probe->response)
+             — does NOT contain firing rate information
+             — forces LSTM to learn temporal dynamics
 
     Returns dict of task_name -> list of (T, n_output) arrays
     """
@@ -127,33 +115,47 @@ def prepare_task_targets(trials, accuracy_labels, load_labels):
     # Task A: existing spike targets (unchanged)
     tasks['task_a'] = [t['Y'] for t in trials]
 
-    # Task B: expand accuracy to per-timestep scalar
-    tasks['task_b'] = []
-    for i, t in enumerate(trials):
-        T = t['X'].shape[0]
-        target = np.full((T, 1), accuracy_labels[i], dtype=np.float32)
-        tasks['task_b'].append(target)
+    # Task B2: output population mean rate per timestep
+    # This is mean(Y, axis=1) — a scalar time series the LSTM can learn
+    tasks['task_b2'] = []
+    for t in trials:
+        Y = t['Y']
+        mean_rate = np.mean(Y, axis=1, keepdims=True)  # (T, 1)
+        # Epsilon-safe scaling
+        mr_mean = np.mean(mean_rate)
+        mr_std = np.std(mean_rate) + 1e-8
+        mean_rate_scaled = (mean_rate - mr_mean) / mr_std
+        tasks['task_b2'].append(mean_rate_scaled.astype(np.float32))
 
-    # Task C: expand load to per-timestep one-hot
-    # Load values are 1, 2, 3 -> indices 0, 1, 2
-    unique_loads = sorted(np.unique(load_labels))
-    load_to_idx = {v: i for i, v in enumerate(unique_loads)}
-    n_categories = len(unique_loads)
+    # Task C2: temporal epoch identity as one-hot per timestep
+    # epoch masks encode: 0=fixation, 1=encoding, 2=maintenance, 3=probe, 4=response
+    n_epochs = 5
+    tasks['task_c2'] = []
+    epoch_counts = np.zeros(n_epochs, dtype=int)
+    for t in trials:
+        epoch = t['epoch']
+        T = len(epoch)
+        one_hot = np.zeros((T, n_epochs), dtype=np.float32)
+        for ei in range(n_epochs):
+            one_hot[epoch == ei, ei] = 1.0
+        tasks['task_c2'].append(one_hot)
+        for ei in range(n_epochs):
+            epoch_counts[ei] += int(np.sum(epoch == ei))
 
-    tasks['task_c'] = []
-    for i, t in enumerate(trials):
-        T = t['X'].shape[0]
-        one_hot = np.zeros((T, n_categories), dtype=np.float32)
-        one_hot[:, load_to_idx[load_labels[i]]] = 1.0
-        tasks['task_c'].append(one_hot)
-
+    # Diagnostics
     log.info("Task targets prepared:")
-    log.info("  Task A output dim: %d (spike trains)", tasks['task_a'][0].shape[1])
-    log.info("  Task B output dim: %d (accuracy, binary)", tasks['task_b'][0].shape[1])
-    log.info("  Task C output dim: %d (load, %d classes: %s)",
-             tasks['task_c'][0].shape[1], n_categories, unique_loads)
+    log.info("  Task A  output dim: %d (spike trains — 29 neurons)", tasks['task_a'][0].shape[1])
 
-    return tasks, n_categories, unique_loads
+    b2_example = tasks['task_b2'][0]
+    log.info("  Task B2 output dim: %d (output mean rate, per-timestep scalar)", b2_example.shape[1])
+    log.info("    B2 range: [%.3f, %.3f], std=%.3f (z-scored)",
+             b2_example.min(), b2_example.max(), b2_example.std())
+
+    log.info("  Task C2 output dim: %d (epoch one-hot: fix/enc/maint/probe/resp)", n_epochs)
+    log.info("    C2 epoch distribution: %s",
+             dict(zip(['fix', 'enc', 'maint', 'probe', 'resp'], epoch_counts)))
+
+    return tasks
 
 
 # =========================================================================
@@ -201,22 +203,19 @@ def train_task_lstm(trials, target_list, task_name, hidden_dim=64,
 
     log.info("  %s: CC=%.3f (%d epochs)", task_name, cc, n_epochs)
 
-    # Quality gate
+    # Quality gate — CC must be POSITIVE and above threshold
+    # Negative CC means the model learned anti-correlated output (garbage)
     if task_name == 'task_a':
-        passed = cc > 0.3
-        metric_name = 'CC'
-    elif task_name == 'task_b':
-        # For binary: CC > 0.1 is meaningful (imbalanced data)
-        passed = abs(cc) > 0.05
-        metric_name = 'CC'
-    else:  # task_c
-        # For 3-class one-hot: CC > 0.1 is above chance
-        passed = abs(cc) > 0.05
-        metric_name = 'CC'
+        threshold = 0.30
+    elif task_name == 'task_b2':
+        threshold = 0.15  # Scalar prediction should be learnable
+    else:  # task_c2
+        threshold = 0.10  # 5-class epoch prediction
 
-    log.info("  Quality gate: %s=%.3f %s (threshold: %s)",
-             metric_name, cc, "PASS" if passed else "FAIL",
-             "0.30" if task_name == 'task_a' else "0.05")
+    passed = cc > threshold  # Must be positive AND above threshold
+
+    log.info("  Quality gate: CC=%.3f %s (threshold: >%.2f, must be positive)",
+             cc, "PASS" if passed else "FAIL", threshold)
 
     # Extract hidden states
     h_dict = extract_hidden_states(model, X_data, n_trials, device)
@@ -366,91 +365,103 @@ def run_probing_for_task(task_name, H_trained, bio_dict, bio_names,
 
 def print_comparison_table(all_results, bio_names):
     """Print the critical comparison table across all three tasks."""
-    log.info("\n" + "=" * 85)
-    log.info("TASK-DEPENDENCE COMPARISON TABLE")
-    log.info("=" * 85)
-    log.info("%-25s | %-15s | %-17s | %-17s",
-             'Variable', 'Task A (spikes)', 'Task B (accuracy)', 'Task C (load)')
-    log.info("-" * 85)
+    log.info("\n" + "=" * 90)
+    log.info("TASK-DEPENDENCE v2 COMPARISON TABLE")
+    log.info("=" * 90)
+    log.info("%-25s | %-16s | %-18s | %-18s",
+             'Variable', 'A (29n spikes)', 'B2 (mean rate)', 'C2 (epoch 5-cls)')
+    log.info("-" * 90)
 
     for vname in bio_names:
         row = "%-25s" % vname
-        for task_name in ['task_a', 'task_b', 'task_c']:
+        for task_name in ['task_a', 'task_b2', 'task_c2']:
             tr = all_results.get(task_name, {})
             if tr.get('status') == 'FAILED_QUALITY_GATE':
-                row += " | %-15s" % 'FAILED'
+                row += " | %-16s" % 'FAILED'
             else:
                 r2 = tr.get('r2_trained', {}).get(vname, 0)
                 is_mand = vname in tr.get('mandatory', [])
                 marker = '***' if is_mand else ' - '
-                row += " | %7.4f %s    " % (r2, marker)
+                row += " | %7.4f %s     " % (r2, marker)
         log.info(row)
 
-    log.info("-" * 85)
+    log.info("-" * 90)
     log.info("  *** = MANDATORY   - = not mandatory/failed screen")
 
 
 def evaluate_predictions(all_results):
-    """Evaluate the two key predictions."""
+    """Evaluate the key predictions for v2 task design."""
     log.info("\n" + "=" * 80)
-    log.info("PREDICTION CHECK")
+    log.info("PREDICTION CHECK (v2)")
     log.info("=" * 80)
 
     task_a_mand = set(all_results.get('task_a', {}).get('mandatory', []))
-    task_b_mand = set(all_results.get('task_b', {}).get('mandatory', []))
-    task_c_mand = set(all_results.get('task_c', {}).get('mandatory', []))
+    task_b2_mand = set(all_results.get('task_b2', {}).get('mandatory', []))
+    task_c2_mand = set(all_results.get('task_c2', {}).get('mandatory', []))
 
-    # Prediction 1: firing_rate_input drops out of B and C
+    # Prediction 1: firing_rate_input
+    # Task A (spikes): MANDATORY (tautological — output IS spike trains)
+    # Task B2 (mean rate): may survive (output still contains rate info, just scalar)
+    # Task C2 (epoch): should DROP OUT (epoch labels have no rate information)
     fri_a = 'firing_rate_input' in task_a_mand
-    fri_b = 'firing_rate_input' in task_b_mand
-    fri_c = 'firing_rate_input' in task_c_mand
+    fri_b2 = 'firing_rate_input' in task_b2_mand
+    fri_c2 = 'firing_rate_input' in task_c2_mand
 
-    log.info("  firing_rate_input in Task A (spikes):   %s", "YES" if fri_a else "NO")
-    log.info("  firing_rate_input in Task B (accuracy): %s", "YES" if fri_b else "NO")
-    log.info("  firing_rate_input in Task C (load):     %s", "YES" if fri_c else "NO")
+    log.info("  firing_rate_input:")
+    log.info("    Task A  (29n spike trains):  %s", "MANDATORY" if fri_a else "not mandatory")
+    log.info("    Task B2 (output mean rate):  %s", "MANDATORY" if fri_b2 else "not mandatory")
+    log.info("    Task C2 (epoch identity):    %s", "MANDATORY" if fri_c2 else "not mandatory")
 
-    if fri_a and not fri_b and not fri_c:
-        log.info("  >>> PREDICTION CONFIRMED: firing_rate_input is TASK-TAUTOLOGICAL")
-        log.info("  >>> Mandatory only because the output format contained rates")
-    elif fri_a and (fri_b or fri_c):
-        log.info("  >>> PREDICTION REFUTED: firing_rate_input survives task change")
+    if fri_a and not fri_c2:
+        log.info("  >>> firing_rate_input drops out when output has no rate info")
+        if fri_b2:
+            log.info("  >>> but survives for scalar rate prediction — rate info still in output")
+        log.info("  >>> CONCLUSION: firing_rate_input is OUTPUT-FORMAT-DEPENDENT")
+    elif fri_a and fri_c2:
+        log.info("  >>> PREDICTION REFUTED: firing_rate_input mandatory even for epoch prediction")
         log.info("  >>> May be genuinely important for computation")
-    elif not fri_a:
-        log.info("  >>> UNEXPECTED: firing_rate_input not mandatory even in Task A")
 
-    # Prediction 2: theta_gamma_pac survives across tasks
+    # Prediction 2: theta_gamma_pac should survive across all tasks
+    # It reflects temporal world structure, not output format
     tgp_a = 'theta_gamma_pac' in task_a_mand
-    tgp_b = 'theta_gamma_pac' in task_b_mand
-    tgp_c = 'theta_gamma_pac' in task_c_mand
+    tgp_b2 = 'theta_gamma_pac' in task_b2_mand
+    tgp_c2 = 'theta_gamma_pac' in task_c2_mand
 
     log.info("")
-    log.info("  theta_gamma_pac in Task A (spikes):   %s", "YES" if tgp_a else "NO")
-    log.info("  theta_gamma_pac in Task B (accuracy): %s", "YES" if tgp_b else "NO")
-    log.info("  theta_gamma_pac in Task C (load):     %s", "YES" if tgp_c else "NO")
+    log.info("  theta_gamma_pac:")
+    log.info("    Task A  (29n spike trains):  %s", "MANDATORY" if tgp_a else "not mandatory")
+    log.info("    Task B2 (output mean rate):  %s", "MANDATORY" if tgp_b2 else "not mandatory")
+    log.info("    Task C2 (epoch identity):    %s", "MANDATORY" if tgp_c2 else "not mandatory")
 
-    if tgp_a and tgp_b and tgp_c:
+    if tgp_a and tgp_c2:
         log.info("  >>> PREDICTION CONFIRMED: theta_gamma_pac is REALITY-REFLECTIVE")
-        log.info("  >>> Survives task change -- reflects world structure, not output format")
-    elif tgp_a and not (tgp_b and tgp_c):
+        log.info("  >>> Survives task change — reflects temporal world structure")
+    elif tgp_a and not tgp_c2:
         log.info("  >>> PREDICTION PARTIALLY REFUTED: theta_gamma_pac is task-dependent")
 
-    # Classify all variables
+    # Classify all variables across tasks
     log.info("\n" + "=" * 80)
     log.info("VARIABLE CLASSIFICATION")
     log.info("=" * 80)
 
-    tautological = task_a_mand - task_b_mand - task_c_mand
-    reality_reflective = task_a_mand & task_b_mand & task_c_mand
-    mixed = task_a_mand - tautological - reality_reflective
+    # A variable is "rate-tautological" if mandatory in A but not C2 (epoch)
+    # It's "reality-reflective" if mandatory in both A and C2
+    rate_tautological = task_a_mand - task_c2_mand
+    reality_reflective = task_a_mand & task_c2_mand
+    c2_only = task_c2_mand - task_a_mand  # mandatory only for epoch task
 
-    log.info("  TASK-TAUTOLOGICAL (Task A only):  %s", sorted(tautological))
-    log.info("  REALITY-REFLECTIVE (all tasks):   %s", sorted(reality_reflective))
-    log.info("  MIXED (some tasks):               %s", sorted(mixed))
+    log.info("  RATE-TAUTOLOGICAL (Task A only, not C2):  %s", sorted(rate_tautological))
+    log.info("  REALITY-REFLECTIVE (both A and C2):       %s", sorted(reality_reflective))
+    log.info("  EPOCH-SPECIFIC (C2 only, not A):          %s", sorted(c2_only))
+    log.info("  Task B2 mandatory:                        %s", sorted(task_b2_mand))
 
     return {
-        'tautological': sorted(tautological),
+        'rate_tautological': sorted(rate_tautological),
         'reality_reflective': sorted(reality_reflective),
-        'mixed': sorted(mixed),
+        'epoch_specific': sorted(c2_only),
+        'task_a_mandatory': sorted(task_a_mand),
+        'task_b2_mandatory': sorted(task_b2_mand),
+        'task_c2_mandatory': sorted(task_c2_mand),
     }
 
 
@@ -474,12 +485,16 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     log.info("=" * 70)
-    log.info("TASK-DEPENDENCE TEST")
+    log.info("TASK-DEPENDENCE TEST v2")
     log.info("  Question: Is firing_rate_input mandatory because of biology")
     log.info("            or because the output format trivially contains it?")
     log.info("  Method: Same input, three different prediction targets")
-    log.info("  Prediction: firing_rate_input drops out of Tasks B/C")
-    log.info("              theta_gamma_pac survives across all tasks")
+    log.info("  Tasks:")
+    log.info("    A:  29-neuron spike prediction (control — output contains rates)")
+    log.info("    B2: output mean rate (scalar — still contains rate info)")
+    log.info("    C2: temporal epoch (5-class — NO rate info in output)")
+    log.info("  Key prediction: firing_rate_input drops out of C2 (no rates)")
+    log.info("                  theta_gamma_pac survives all tasks")
     log.info("  Subject: sub-%s", args.source_subject)
     log.info("  Device: %s", args.device)
     log.info("  iAAFT surrogates: %d", args.n_surrogates)
@@ -487,26 +502,21 @@ def main():
 
     t_start = time.time()
 
-    # Step 1: Load data with behavioral labels
-    trials, accuracy_labels, load_labels, meta = \
-        load_sub5_with_behavior(args.processed_dir, args.source_subject)
+    # Step 1: Load data
+    trials, meta = load_sub5_data(args.processed_dir, args.source_subject)
 
-    # Step 2: Prepare targets
-    tasks, n_categories, unique_loads = \
-        prepare_task_targets(trials, accuracy_labels, load_labels)
+    # Step 2: Prepare targets (v2: learnable per-timestep targets)
+    tasks = prepare_task_targets(trials)
 
     # Step 3: Compute bio probe variables (ONCE — same for all tasks)
     bio_dict, bio_names = compute_all_bio_targets(trials)
-
-    # Trim bio_names to the 7 used in v3 (compute_bio_variables returns 7)
-    # They should match PROBE_VARIABLES from v3
     log.info("  Probe variables: %s", bio_names)
 
     # Step 4: Train and probe each task
     task_configs = [
-        ('task_a', 'Spike prediction (output contains firing rates)'),
-        ('task_b', 'Accuracy prediction (output = binary, no rates)'),
-        ('task_c', 'Load prediction (output = one-hot set size, no rates)'),
+        ('task_a', 'Spike prediction (29 neurons — output contains firing rates)'),
+        ('task_b2', 'Output mean rate (scalar per timestep — rate info, no spike format)'),
+        ('task_c2', 'Epoch prediction (5-class — NO rate info, temporal structure only)'),
     ]
 
     all_results = {}
@@ -556,14 +566,14 @@ def main():
     total_time = time.time() - t_start
 
     save_data = {
-        'experiment': 'task_dependence_test',
+        'experiment': 'task_dependence_test_v2',
         'source_subject': args.source_subject,
         'hidden_dim': args.hidden_dim,
         'n_surrogates': args.n_surrogates,
         'total_time_min': total_time / 60,
         'task_a_mandatory': all_results.get('task_a', {}).get('mandatory', []),
-        'task_b_mandatory': all_results.get('task_b', {}).get('mandatory', []),
-        'task_c_mandatory': all_results.get('task_c', {}).get('mandatory', []),
+        'task_b2_mandatory': all_results.get('task_b2', {}).get('mandatory', []),
+        'task_c2_mandatory': all_results.get('task_c2', {}).get('mandatory', []),
         'classification': classification,
         'task_details': {
             task_name: {
